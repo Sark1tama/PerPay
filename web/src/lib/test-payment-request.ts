@@ -21,6 +21,7 @@ const rejectedBeforeCreation: Readonly<Record<string, number>> = {
   reconciliation_not_ready: 503,
   system_not_configured: 503,
   amount_slots_exhausted: 503,
+  amount_too_small: 422,
   site_paused: 503,
   site_order_limit_exceeded: 503,
   site_not_found: 404,

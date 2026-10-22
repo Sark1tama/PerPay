@@ -148,6 +148,7 @@ describe("uncertain test-payment creation recovery", () => {
 
   it.each([
     [422, "validation_failed"],
+    [422, "amount_too_small"],
     [403, "csrf_invalid"],
     [503, "reconciliation_not_ready"],
   ] as const)(
@@ -203,6 +204,38 @@ describe("uncertain test-payment creation recovery", () => {
       await user.click(screen.getByRole("button", { name: "创建测试订单" }));
       await screen.findByRole("heading", { name: "测试订单已创建" });
       expect((await view.requests()[1]!.clone().json()).amount_cents).toBe(234);
+    },
+  );
+
+  it.each([false, true])(
+    "allows correcting a rejected one-cent downward test payment (standalone=%s)",
+    async (standalone) => {
+      const message = "向下调整金额时，下单金额至少为 0.02 元";
+      const view = mount((_r, attempt) =>
+        attempt === 1
+          ? apiError("amount_too_small", message, 422)
+          : json({ data: { ...created, requested_amount_cents: 2, payable_amount_cents: 1 } }, 201),
+        standalone ? "/test-payment" : "/",
+      );
+      const user = userEvent.setup();
+      if (!standalone) await user.click(await screen.findByRole("button", { name: "测试收款" }));
+      const amount = await screen.findByLabelText("测试金额（元）");
+      await selectTestWebsite();
+      expect(amount).toHaveValue("0.01");
+      await user.click(screen.getByRole("button", { name: "创建测试订单" }));
+      await screen.findByText(message);
+      expect(screen.queryByText("创建结果待确认")).not.toBeInTheDocument();
+      expect(amount).not.toHaveAttribute("readonly");
+      expect(unloadBlocked()).toBe(false);
+      fireEvent.change(amount, { target: { value: "0.02" } });
+      await user.click(screen.getByRole("button", { name: "创建测试订单" }));
+      await screen.findByRole("heading", { name: "测试订单已创建" });
+      expect(view.requests()).toHaveLength(2);
+      const first = await view.requests()[0]!.clone().json();
+      const second = await view.requests()[1]!.clone().json();
+      expect(first.amount_cents).toBe(1);
+      expect(second.amount_cents).toBe(2);
+      expect(second.test_payment_id).not.toBe(first.test_payment_id);
     },
   );
 

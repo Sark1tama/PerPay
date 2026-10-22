@@ -22,7 +22,7 @@ describe("amount adjustment direction", () => {
       render(<Editor section={section} />);
       expect(screen.getByRole("combobox", { name: "金额调整方向" })).toHaveTextContent("向上加价");
       await user.click(screen.getByRole("combobox", { name: "金额调整方向" }));
-      await user.click(screen.getByRole("option", { name: "向下减价" }));
+      await user.click(await screen.findByRole("option", { name: "向下减价" }));
       expect(screen.getByLabelText("saved direction")).toHaveTextContent("DOWN");
       expect(screen.getByLabelText("最大调整金额（分）")).toHaveValue(99);
     });
