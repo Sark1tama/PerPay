@@ -11,6 +11,7 @@ import { createApp } from "../src/http/app.ts";
 import { signApiRequest } from "../src/security/api-signature.ts";
 import { SiteStore } from "../src/sites/store.ts";
 import { LedgerStore } from "../src/ledger/store.ts";
+import { readAdminLedgerPage } from "../src/ledger/admin-query.ts";
 import { ReconciliationStore } from "../src/reconciliation/store.ts";
 import { siteOrderPolicySchema } from "../src/sites/model.ts";
 import { createConfiguredLegacyHttpServices } from "./http-fixture.ts";
@@ -134,13 +135,32 @@ describe("bidirectional amount allocation", () => {
         evidence: { httpStatus: 200, headers: {}, body: JSON.stringify({ id, amount }), traceId: id, signatureVerified: true }, now });
       const entry = result.normalized[0];
       assert.ok(entry && entry.kind === "created");
-      const decision = new ReconciliationStore(f.database).reconcileEntry(entry.entry.ledgerEntryId, now + 1);
+      const reconciliation = new ReconciliationStore(f.database);
+      const candidates = reconciliation.manualLedgerPage({
+        contextId: order.orderId, q: "0.99", view: "recommended", limit: 20, position: null,
+        siteClientId: site.clientId,
+      });
+      assert.equal(candidates?.items.length, 1);
+      assert.equal(candidates!.items[0]!.record.ledgerEntryId, entry.entry.ledgerEntryId);
+      assert.equal(candidates!.items[0]!.recommendation?.amountMatch, true);
+      const decision = reconciliation.reconcileEntry(entry.entry.ledgerEntryId, now + 1);
       assert.equal(decision.kind, "auto_settled");
       f.setNow(now + 2);
       const confirmed = orders.get(order.orderId);
       assert.equal(confirmed.requestedAmountCents, 100);
       assert.equal(confirmed.payableAmountCents, 99);
       assert.equal(confirmed.receivedAmountCents, 99);
+      const matched = readAdminLedgerPage(f.database, {
+        environment: "PRODUCTION", associationStatus: "MATCHED", hasReversals: false,
+        minAmountCents: 99, maxAmountCents: 99, sortBy: "amount_cents",
+      });
+      assert.equal(matched.items.length, 1);
+      assert.equal(matched.items[0]!.amount_cents, 99);
+      assert.equal(matched.items[0]!.active_match?.order_id, order.orderId);
+      assert.equal(matched.items[0]!.last_associated_at, new Date(now + 1).toISOString());
+      assert.equal(readAdminLedgerPage(f.database, {
+        environment: "PRODUCTION", associationStatus: "UNMATCHED",
+      }).items.length, 0);
       const payload = f.database.read(db => JSON.parse(String(db.prepare("SELECT payload_json FROM outbox_events WHERE aggregate_id = ?").get(order.orderId)!.payload_json)));
       assert.equal(payload.requested_amount_cents, 100);
       assert.equal(payload.payable_amount_cents, 99);
