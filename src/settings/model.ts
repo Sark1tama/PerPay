@@ -1,4 +1,5 @@
 import { collectionPolicyFields, validateCollectionPolicy } from "./collection-policy.ts";
+import type { AmountOffsetDirection } from "../orders/model.ts";
 import type { AdminAccess } from "./admin-access.ts";
 import { checkoutHelpUrl } from "../shared/checkout-help.ts";
 import {
@@ -39,6 +40,7 @@ export interface CollectionSettings {
   readonly codePayload: string;
   readonly orderTtlSeconds: number;
   readonly amountOffsetMaximumCents: number;
+  readonly amountOffsetDirection?: AmountOffsetDirection | undefined;
   readonly amountReuseCooldownSeconds: number;
 }
 

@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { amountOffsetDirectionSchema } from "../orders/model.ts";
 import { z } from "zod";
 import {
   collectionSettingsInputSchema,
@@ -14,6 +15,7 @@ const nameSchema = displaySettingsInputSchema.shape.system_name.unwrap();
 
 export const siteOrderPolicySchema = z.object({
   order_ttl_seconds: collectionSettingsInputSchema.shape.order_ttl_seconds,
+  amount_offset_direction: amountOffsetDirectionSchema.optional(),
   amount_offset_maximum_cents: collectionSettingsInputSchema.shape.amount_offset_maximum_cents,
   amount_reuse_cooldown_seconds: collectionSettingsInputSchema.shape.amount_reuse_cooldown_seconds.unwrap(),
   pending_order_limit: z.number().int().positive().nullable(),

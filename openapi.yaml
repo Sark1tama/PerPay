@@ -6828,7 +6828,7 @@ components:
           pattern: '^[A-Za-z0-9][A-Za-z0-9._-]{2,63}$'
         merchant_order_no: { $ref: '#/components/schemas/MerchantOrderNumber' }
         requested_amount_cents: { type: integer, minimum: 1, maximum: 9999999998 }
-        payable_amount_cents: { type: integer, minimum: 2, maximum: 9999999999 }
+        payable_amount_cents: { type: integer, minimum: 1, maximum: 9999999999 }
         received_amount_cents:
           type: [integer, 'null']
           minimum: 1
@@ -6878,7 +6878,7 @@ components:
           pattern: '^[A-Za-z0-9][A-Za-z0-9._-]{2,63}$'
         merchant_order_no: { $ref: '#/components/schemas/MerchantOrderNumber' }
         requested_amount_cents: { type: integer, minimum: 1, maximum: 9999999998 }
-        payable_amount_cents: { type: integer, minimum: 2, maximum: 9999999999 }
+        payable_amount_cents: { type: integer, minimum: 1, maximum: 9999999999 }
         received_amount_cents:
           type: [integer, 'null']
           minimum: 1
@@ -7040,7 +7040,7 @@ components:
         order_id: { type: string, format: uuid }
         merchant_order_no: { $ref: '#/components/schemas/MerchantOrderNumber' }
         requested_amount_cents: { type: integer, minimum: 1, maximum: 9999999998 }
-        payable_amount_cents: { type: integer, minimum: 2, maximum: 9999999999 }
+        payable_amount_cents: { type: integer, minimum: 1, maximum: 9999999999 }
         received_amount_cents:
           type: [integer, 'null']
           minimum: 1
@@ -7191,7 +7191,7 @@ components:
       additionalProperties: false
       required: [payable_amount_cents, currency, collection_code_payload]
       properties:
-        payable_amount_cents: { type: integer, minimum: 2, maximum: 9999999999 }
+        payable_amount_cents: { type: integer, minimum: 1, maximum: 9999999999 }
         currency: { const: CNY }
         collection_code_payload:
           type: string
@@ -7960,7 +7960,7 @@ components:
         site_name: { type: [string, 'null'], description: "Current owning site name; administrator responses only. Null for historical pre-site schema fixtures." }
         merchant_order_no: { type: string, minLength: 1, maxLength: 128 }
         requested_amount_cents: { type: integer, minimum: 1, maximum: 9999999999 }
-        payable_amount_cents: { type: integer, minimum: 2, maximum: 9999999999 }
+        payable_amount_cents: { type: integer, minimum: 1, maximum: 9999999999 }
         received_amount_cents: { type: [integer, 'null'], minimum: 1, maximum: 999999999999 }
         currency: { const: CNY }
         product_name: { type: string, minLength: 1, maxLength: 200 }
@@ -8191,7 +8191,7 @@ components:
         product_name: { type: string, minLength: 1, maxLength: 200 }
         note: { type: [string, 'null'], maxLength: 500 }
         requested_amount_cents: { type: integer, minimum: 1, maximum: 9999999998 }
-        payable_amount_cents: { type: integer, minimum: 2, maximum: 9999999999 }
+        payable_amount_cents: { type: integer, minimum: 1, maximum: 9999999999 }
         received_amount_cents: { type: integer, minimum: 1, maximum: 9999999999 }
         currency: { const: CNY }
         payment_status:
@@ -8563,6 +8563,7 @@ components:
         - work_item_not_found
         - work_item_ended
         - amount_slots_exhausted
+        - amount_too_small
         - api_authentication_failed
         - api_client_invalid
         - api_nonce_replayed
@@ -8675,6 +8676,11 @@ components:
               type: integer
               minimum: 60
               maximum: 1800
+            amount_offset_direction:
+              type: string
+              enum: [UP, DOWN]
+              default: UP
+              description: Adjust new orders upward or downward by 1..N cents; DOWN requires an order amount of at least 2 cents and never allocates less than 1 cent. Existing orders retain their allocated amount.
             amount_offset_maximum_cents:
               type: integer
               minimum: 1

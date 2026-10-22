@@ -19,6 +19,7 @@ import {
 } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 
 export function SitePolicyFields({
   value,
@@ -37,6 +38,7 @@ export function SitePolicyFields({
   secondsDraft?: string;
   onSecondsDraftChange?: (raw: string) => void;
 }) {
+  const directionId = useId();
   const limitId = useId();
   const timeoutId = useId();
   const timeoutRaw = secondsDraft ?? siteTimeoutSeconds(value.notification_delivery.timeout_milliseconds);
@@ -82,8 +84,35 @@ export function SitePolicyFields({
               })
             }
           />
+          <Field data-invalid={!!error("orders.amount_offset_direction")}>
+            <FieldLabel htmlFor={directionId}>金额调整方向</FieldLabel>
+            <Select
+              disabled={disabled}
+              value={value.orders.amount_offset_direction ?? "UP"}
+              items={[{ value: "UP", label: "向上加价" }, { value: "DOWN", label: "向下减价" }]}
+              onValueChange={(direction) => {
+                if (direction === "UP" || direction === "DOWN") change((p) => {
+                  p.orders.amount_offset_direction = direction;
+                });
+              }}
+            >
+              <SelectTrigger id={directionId} aria-label="金额调整方向"
+                aria-invalid={!!error("orders.amount_offset_direction")}
+                aria-describedby={directionId + "-hint" + (error("orders.amount_offset_direction") ? " " + directionId + "-error" : "")}>
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="UP">向上加价</SelectItem>
+                <SelectItem value="DOWN">向下减价</SelectItem>
+              </SelectContent>
+            </Select>
+            <FieldDescription id={directionId + "-hint"}>
+              从 1 分开始分配可用金额，仅影响新订单。向下减价时，下单金额至少为 0.02 元，应付金额最低为 0.01 元。
+            </FieldDescription>
+            <FieldError id={directionId + "-error"}>{error("orders.amount_offset_direction")}</FieldError>
+          </Field>
           <NumberField
-            label="最大加价金额（分）"
+            label="最大调整金额（分）"
             error={error("orders.amount_offset_maximum_cents")}
             value={value.orders.amount_offset_maximum_cents}
             min={1}

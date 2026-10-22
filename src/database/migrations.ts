@@ -1,3 +1,4 @@
+import { AMOUNT_OFFSET_SCHEMA_SQL } from "./amount-offset-migration.ts";
 import { MULTI_SITE_SCHEMA_SQL } from "../sites/migrations/schema.ts";
 import { createHash } from "node:crypto";
 
@@ -5011,4 +5012,5 @@ export const migrations: readonly Migration[] = [
         WHERE existing_ledger_entry_id IS NOT NULL;
     `,
   },
+  { version: 36, name: "bidirectional_amount_offsets", sql: AMOUNT_OFFSET_SCHEMA_SQL },
 ] as const;

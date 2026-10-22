@@ -2654,6 +2654,7 @@ function orderStatus(code: OrderErrorCode): 404 | 409 | 422 | 503 {
     case "webhook_target_not_allowed":
     case "return_url_invalid":
     case "return_url_not_allowed":
+    case "amount_too_small":
       return 422;
   }
 }

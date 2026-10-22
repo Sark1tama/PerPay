@@ -8,6 +8,7 @@ export const HTTP_ERROR_CODES = Object.freeze([
   "work_item_not_found",
   "work_item_ended",
   "amount_slots_exhausted",
+  "amount_too_small",
   "api_authentication_failed",
   "api_client_invalid",
   "api_nonce_replayed",

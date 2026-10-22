@@ -3,6 +3,9 @@ import { createHash } from "node:crypto";
 
 import { z } from "zod";
 
+export const amountOffsetDirectionSchema = z.enum(["UP", "DOWN"]);
+export type AmountOffsetDirection = z.infer<typeof amountOffsetDirectionSchema>;
+
 export const MAX_REQUESTED_AMOUNT_CENTS = 9_999_999_998;
 export const MAX_IDEMPOTENCY_KEY_BYTES = 256;
 export const MAX_ORDER_PRODUCT_NAME_CHARACTERS = 200;

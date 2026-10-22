@@ -20,6 +20,7 @@ import {
   ORDER_RETURN_URL_FINGERPRINT_VERSION,
   ORDER_NOTE_FINGERPRINT_VERSION,
   orderEventDetailsFingerprint,
+  type AmountOffsetDirection,
   type AdminOrderCursor,
   type AdminOrderFilters,
   type AdminOrderEventProjection,
@@ -120,6 +121,7 @@ export interface CreateStoredOrderInput {
   readonly requestFingerprint: string;
   readonly ttlMilliseconds: number;
   readonly amountOffsetMaximumCents: number;
+  readonly amountOffsetDirection?: AmountOffsetDirection | undefined;
   readonly amountReuseCooldownSeconds?: number | undefined;
   /** Runtime checkout policy captured when this order is created. */
   readonly checkoutKeyRotationMilliseconds?: number | undefined;
@@ -141,6 +143,7 @@ export type CreateStoredOrderResult =
   | { readonly kind: "existing"; readonly aggregate: StoredOrderAggregate }
   | { readonly kind: "idempotency_conflict"; readonly orderId: string }
   | { readonly kind: "merchant_order_conflict"; readonly orderId: string }
+  | { readonly kind: "amount_too_small" }
   | {
       readonly kind: "webhook_target_rejected";
       readonly code: WebhookTargetErrorCode;
@@ -437,6 +440,11 @@ export class OrderStore {
         return { kind: "merchant_order_conflict", orderId: merchantOrder.order.orderId };
       }
 
+      // Replays above retain their original amount even after the site changes direction.
+      if (input.amountOffsetDirection === "DOWN" && input.request.amount_cents < 2) {
+        return { kind: "amount_too_small" };
+      }
+
       const profile = readActiveCollectionProfile(connection);
       if (!profile) throw new Error("collection profile is not initialized");
 
@@ -445,6 +453,7 @@ export class OrderStore {
         input.request.amount_cents,
         input.amountOffsetMaximumCents,
         now,
+        input.amountOffsetDirection ?? "UP",
       );
       if (allocation.kind === "exhausted") {
         return {
@@ -907,11 +916,12 @@ function allocateAmountSlot(
   requestedAmountCents: number,
   maximumOffsetCents: number,
   now: number,
+  direction: AmountOffsetDirection,
 ): AmountAllocationResult {
   let earliestAvailableAt: number | undefined;
   for (let offset = 1; offset <= maximumOffsetCents; offset += 1) {
-    const payableAmountCents = requestedAmountCents + offset;
-    if (payableAmountCents > MAX_PAYABLE_AMOUNT_CENTS) break;
+    const payableAmountCents = requestedAmountCents + (direction === "DOWN" ? -offset : offset);
+    if (payableAmountCents < 1 || payableAmountCents > MAX_PAYABLE_AMOUNT_CENTS) break;
 
     const open = connection.prepare(
       `SELECT order_id, expires_at, amount_reuse_cooldown_seconds
@@ -950,7 +960,7 @@ function allocateAmountSlot(
       expires_at: bigint | number;
       amount_reuse_cooldown_seconds: bigint | number;
     } | undefined;
-    // Ascending offsets select the smallest available amount, whether new or reused.
+    // Prefer the smallest adjustment in the selected direction, whether new or reused.
     if (!latest) return { kind: "allocated", payableAmountCents, generation: 1 };
     if (latest.released_at === null) {
       throw new Error("active amount slot is detached from its open order");

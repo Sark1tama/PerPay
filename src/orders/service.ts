@@ -52,6 +52,7 @@ export type OrderErrorCode =
   | "idempotency_conflict"
   | "merchant_order_no_conflict"
   | "amount_slots_exhausted"
+  | "amount_too_small"
   | "checkout_not_found"
   | "order_clock_unavailable"
   | "system_not_configured"
@@ -179,6 +180,7 @@ export class OrderService {
           requestFingerprint: fingerprintCreateOrderRequest(request),
           ttlMilliseconds: settings.collection.orderTtlSeconds * 1000,
           amountOffsetMaximumCents: settings.collection.amountOffsetMaximumCents,
+          amountOffsetDirection: settings.collection.amountOffsetDirection,
           amountReuseCooldownSeconds: settings.collection.amountReuseCooldownSeconds,
           checkoutKeyRotationMilliseconds: settings.advanced.checkoutKeyRotationDays *
             24 * 60 * 60 * 1_000,
@@ -211,6 +213,8 @@ export class OrderService {
         throw webhookTargetOrderError(result.code);
       case "return_url_rejected":
         throw returnUrlOrderError(result.code);
+      case "amount_too_small":
+        throw new OrderError("amount_too_small", "向下调整金额时，下单金额至少为 0.02 元");
       case "amount_slots_exhausted":
         throw new OrderError(
           "amount_slots_exhausted",
@@ -404,7 +408,7 @@ export class OrderService {
     const policy = site?.configuration.policy;
     let collection: CollectionSettings;
     if (policy) {
-      collection = { codePayload: settings.collection.codePayload, orderTtlSeconds: policy.orders.order_ttl_seconds, amountOffsetMaximumCents: policy.orders.amount_offset_maximum_cents, amountReuseCooldownSeconds: policy.orders.amount_reuse_cooldown_seconds };
+      collection = { codePayload: settings.collection.codePayload, orderTtlSeconds: policy.orders.order_ttl_seconds, amountOffsetMaximumCents: policy.orders.amount_offset_maximum_cents, amountOffsetDirection: policy.orders.amount_offset_direction ?? "UP", amountReuseCooldownSeconds: policy.orders.amount_reuse_cooldown_seconds };
     } else if ("webhook" in settings) {
       collection = settings.collection;
     } else {

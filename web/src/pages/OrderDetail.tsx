@@ -135,7 +135,7 @@ function OrderDesk({ order }: { order: AdminOrderDetail }) {
           <Card key="amount" data-order-card="amount">
             <CardHeader>
               <CardTitle role="heading" aria-level={2}>金额</CardTitle>
-              <CardDescription>应付金额 = 下单金额 + 加价金额；实收金额来自支付宝流水。</CardDescription>
+              <CardDescription>应付金额 = 下单金额 + 调整金额（加价为正，减价为负）；实收金额来自支付宝流水。</CardDescription>
             </CardHeader>
             <CardContent className="flex min-w-0 flex-col gap-4">
               <section aria-label="业务网站传入的金额" className="flex min-w-0 flex-col gap-3">
@@ -145,7 +145,7 @@ function OrderDesk({ order }: { order: AdminOrderDetail }) {
               <section aria-label="PerPay 计算的金额" className="flex min-w-0 flex-col gap-3">
                 <h3 className="text-sm font-medium">PerPay 计算</h3>
                 <DetailFields compact items={[
-                  ["加价金额", <ListMoney value={order.payable_amount_cents - order.requested_amount_cents} secondary />],
+                  ["调整金额", <ListMoney value={order.payable_amount_cents - order.requested_amount_cents} secondary />],
                   ["应付金额", <ListMoney value={order.payable_amount_cents} />],
                 ]} />
               </section>

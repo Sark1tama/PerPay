@@ -39,7 +39,7 @@ it("boots the current schema without an implicit website and persists independen
   try {
     let { sites } = stores(database, masterKey);
     assert.deepEqual(sites.list(), []);
-    assert.equal(database.read(db => db.prepare("SELECT max(version) AS version FROM schema_migrations").get()?.version), 35n);
+    assert.equal(database.read(db => db.prepare("SELECT max(version) AS version FROM schema_migrations").get()?.version), 36n);
     const created = ["网站 A", "网站 B"].map(name => sites.create({ operation_id: randomUUID(), configuration: {
       name, accepting_orders: true, notifications_enabled: false, notification_origin: null, return_origin: null, policy: sites.defaults().policy,
     } }, audit));

@@ -7,7 +7,8 @@ const fields = [
   ["basic", "name", "业务网站名称"],
   ["basic", "accepting_orders", "允许新订单"],
   ["orders", "policy.orders.order_ttl_seconds", "收银台有效期（秒）"],
-  ["orders", "policy.orders.amount_offset_maximum_cents", "最大加价金额（分）"],
+  ["orders", "policy.orders.amount_offset_direction", "金额调整方向"],
+  ["orders", "policy.orders.amount_offset_maximum_cents", "最大调整金额（分）"],
   ["orders", "policy.orders.amount_reuse_cooldown_seconds", "应付金额复用等待（秒）"],
   ["orders", "policy.orders.pending_order_limit", "待付款订单上限"],
   ["integration", "notifications_enabled", "开启通知"],
@@ -44,7 +45,7 @@ function fieldLocation(configuration: object, path: FieldPath) {
 
 function read(configuration: object, path: FieldPath): FieldValue {
   const { target, key } = fieldLocation(configuration, path);
-  return target[key] as FieldValue;
+  return (path === "policy.orders.amount_offset_direction" ? target[key] ?? "UP" : target[key]) as FieldValue;
 }
 
 function mergeFields<Configuration extends object>(
