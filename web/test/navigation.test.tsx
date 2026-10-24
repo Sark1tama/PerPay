@@ -238,31 +238,21 @@ describe("navigation and draft protection", () => {
     }
   });
 
-  it("keeps the same default tabs on narrow screens and activates explicitly", async () => {
+  it("uses a mobile category selector that navigates without implicitly saving", async () => {
     const view = mount({
       path: "/settings/display",
       configured: true,
       mobile: true,
     });
-    const list = await screen.findByRole("tablist", { name: "设置分类" });
-    expect(list).toHaveAttribute("data-variant", "default");
-    expect(list.closest("[data-settings-tabs-scroll]")).toHaveClass(
-      "no-scrollbar",
-      "overflow-x-auto",
-    );
-    const selector = screen.getByRole("tab", { name: "界面显示" });
-    expect(selector).toHaveAttribute("aria-selected", "true");
-    expect(
-      screen.queryByRole("combobox", { name: "设置分类" }),
-    ).not.toBeInTheDocument();
+    const selector = await screen.findByRole("combobox", { name: "设置分类" });
+    expect(selector).toHaveTextContent("界面显示");
+    expect(screen.queryByRole("tablist", { name: "设置分类" })).not.toBeInTheDocument();
     const user = userEvent.setup();
-    await user.click(screen.getByRole("tab", { name: "查账设置" }));
+    await user.click(selector);
+    await user.click(await screen.findByRole("option", { name: "查账设置" }));
     await screen.findByLabelText("查账有效时限（秒）");
     expect(view.router.state.location.pathname).toBe("/settings/collection-policy");
-    expect(screen.getByRole("tab", { name: "查账设置" })).toHaveAttribute(
-      "aria-selected",
-      "true",
-    );
+    expect(screen.getByRole("combobox", { name: "设置分类" })).toHaveTextContent("查账设置");
     expect(
       view.fetchMock.mock.calls.some(([request]) => request.method !== "GET"),
     ).toBe(false);
@@ -294,7 +284,7 @@ describe("navigation and draft protection", () => {
     ).toBe(false);
   });
   it("moves tab focus with arrows without discarding drafts until Enter activates", async () => {
-    const view = mount({ mobile: true });
+    const view = mount();
     const { user, field } = await edit();
     const selected = screen.getByRole("tab", { name: "查账设置" });
     selected.focus();
@@ -312,17 +302,24 @@ describe("navigation and draft protection", () => {
     expect(field).toHaveValue(450);
   });
 
-  it("keeps the test-payment action accessible while compacting its visible label on small screens", async () => {
-    mount({ path: "/", configured: true });
+  it("offers test payment through mobile page actions and restores its focus after cancellation", async () => {
+    const view = mount({ path: "/", configured: true, mobile: true });
     await screen.findByRole("heading", { name: "收款趋势" });
-    const testPayment = screen.getByRole("button", { name: "测试收款" });
-    expect(testPayment).not.toHaveClass("hidden");
-    expect(testPayment).toHaveClass("inline-flex");
-    expect(testPayment).toHaveAccessibleName("测试收款");
-    expect(testPayment?.querySelector("span")).toHaveClass(
-      "sr-only",
-      "sm:not-sr-only",
-    );
+    const user = userEvent.setup();
+    const more = screen.getByRole("button", { name: "页面操作" });
+    expect(screen.queryByRole("button", { name: "测试收款" })).not.toBeInTheDocument();
+    await user.click(more);
+    const actions = await screen.findByRole("dialog", { name: "页面操作" });
+    const testPayment = within(actions).getByRole("button", { name: "测试收款" });
+    await user.click(testPayment);
+    const payment = await screen.findByRole("dialog", { name: "测试收款" });
+    expect(within(payment).getByLabelText("测试金额（元）")).toBeVisible();
+    await user.click(within(payment).getByRole("button", { name: "取消" }));
+    await waitFor(() => expect(testPayment).toHaveFocus());
+    expect(view.router.state.location.pathname).toBe("/");
+    expect(view.fetchMock.mock.calls.some(([request]) => request.method !== "GET")).toBe(false);
+    await user.keyboard("{Escape}");
+    await waitFor(() => expect(more).toHaveFocus());
   });
   it("uses the official account menu without duplicate branding or palette controls", async () => {
     const { container, fetchMock } = mount();
@@ -638,9 +635,14 @@ describe("page actions in the shared header", () => {
       const { container, router } = mount({ mobile, configured: true });
       await screen.findByLabelText("查账有效时限（秒）");
       const header = container.querySelector("header")!;
-      const wizard = within(header).getByRole("link", { name: "配置向导" });
-      const refresh = within(header).getByRole("button", { name: "刷新" });
-      const theme = within(header).getByRole("button", { name: /外观/ });
+      if (mobile) {
+        expect(within(header).queryByRole("link", { name: "配置向导" })).not.toBeInTheDocument();
+        await userEvent.click(within(header).getByRole("button", { name: "页面操作" }));
+      }
+      const actions = mobile ? await screen.findByRole("dialog", { name: "页面操作" }) : header;
+      const wizard = within(actions).getByRole("link", { name: "配置向导" });
+      const refresh = within(actions).getByRole("button", { name: "刷新" });
+      const theme = within(actions).getByRole("button", { name: /外观/ });
       expect(
         wizard.compareDocumentPosition(theme) &
           Node.DOCUMENT_POSITION_FOLLOWING,
@@ -676,18 +678,16 @@ describe("page actions in the shared header", () => {
       expect(
         within(header).queryByRole("link", { name: "配置向导" }),
       ).not.toBeInTheDocument();
-      expect(
-        header.querySelector("[data-page-header-actions]"),
-      ).toBeEmptyDOMElement();
+      const emptyActions = header.querySelector("[data-page-header-actions]");
+      if (mobile) expect(screen.queryByRole("dialog", { name: "页面操作" })).not.toBeInTheDocument();
+      else expect(emptyActions).toBeEmptyDOMElement();
       await act(async () => {
         await router.navigate("/orders");
       });
       expect(
         within(header).queryByRole("button", { name: "刷新" }),
       ).not.toBeInTheDocument();
-      expect(
-        header.querySelector("[data-page-header-actions]"),
-      ).toBeEmptyDOMElement();
+      if (!mobile) expect(header.querySelector("[data-page-header-actions]")).toBeEmptyDOMElement();
     },
   );
 
