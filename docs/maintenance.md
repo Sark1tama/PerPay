@@ -4,6 +4,8 @@
 
 以下命令在 `docker-compose.yml` 所在目录执行。[返回部署说明](../README.md)。
 
+定制实例应使用固定定制镜像，详见[定制部署指南](deployment.md)和[Fork 维护](fork-maintenance.md)。本文的上游 Release/拉取命令是通用示例，不表示本 Fork 可直接切换到上游镜像；迁移36/37须核对下文的定制差异。真实部署信息在部署方的私有运维记录中维护。
+
 ## 查看状态
 
 ```sh

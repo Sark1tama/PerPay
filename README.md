@@ -21,6 +21,12 @@
   <a href="USAGE.md">接入文档</a>
 </p>
 
+## 本 Fork 的维护入口
+
+这里是 [Sark1tama/PerPay](https://github.com/Sark1tama/PerPay) 定制仓库，保留金额向下调整和收银台精确金额提示。新维护会话先读 [AGENTS.md](AGENTS.md)、[Fork 技术说明](docs/fork-maintenance.md)及[定制部署指南](docs/deployment.md)，其余资料见[文档索引](docs/README.md)。公开文档不记录部署方的实际地址、凭据位置或运行快照。
+
+本页徽章、Release 和通用部署步骤沿用上游信息，**不能直接用上游 latest 覆盖已有定制实例**。本 Fork 的迁移36与上游36含义不同，生产镜像与数据库兼容性以维护文档和实际核验为准。
+
 ## 功能
 
 | 功能 | 说明 |
