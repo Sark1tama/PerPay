@@ -29,7 +29,17 @@ test.describe("touch and reduced motion", () => {
     const dialog = page.getByRole("dialog", { name: "支付宝付款二维码" });
     const close = dialog.getByRole("button", { name: "关闭对话框" });
     await expect(close).toBeInViewport();
+    const body = dialog.locator("[data-qr-dialog-body]");
+    expect(await body.evaluate(element => element.clientHeight)).toBeGreaterThan(0);
+    const amount = body.locator("p").first();
+    await amount.scrollIntoViewIfNeeded();
+    await expect(amount).toBeInViewport();
+    const image = body.locator("[data-qr-dialog-image]");
+    await image.scrollIntoViewIfNeeded();
+    await expect(image).toBeInViewport();
     await dialog.locator("[data-qr-dialog-body]").evaluate(element => element.scrollTop = element.scrollHeight);
+    await body.getByText("精确金额", { exact: true }).scrollIntoViewIfNeeded();
+    await expect(body.getByText("精确金额", { exact: true })).toBeInViewport();
     await expect(close).toBeInViewport();
     await close.click();
     await expect(page.getByRole("button", { name: "放大二维码" })).toBeFocused();

@@ -330,7 +330,7 @@ export function createCheckoutController(initial: CheckoutInitial) {
             busy: false,
             feedback:
               progress?.state === "COMPLETED"
-                ? "目前还没有确认这笔付款，页面会继续更新。"
+                ? "目前尚未确认这笔付款。请核对是否按页面显示的精确金额支付（如0.99、0.98元，而不是1元），请勿四舍五入。页面会继续更新，已正确付款请勿重复支付，错误金额支付会在24小时内退回。"
                 : progress?.state === "FAILED"
                   ? "本次核实未完成或查账暂有延迟，页面会继续自动更新。"
                   : "核实进度暂不可用，页面会继续自动更新。",

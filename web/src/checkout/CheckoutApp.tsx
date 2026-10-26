@@ -381,9 +381,6 @@ export function CheckoutApp({ initial }: { initial: CheckoutInitial }) {
                           <DialogContent className="flex max-h-[calc(100dvh-2rem)] flex-col overflow-hidden sm:max-w-md">
                             <DialogHeader className="shrink-0 pr-12">
                               <DialogTitle>支付宝付款二维码</DialogTitle>
-                              <DialogDescription>
-                                <ExactAmountNotice />勿重复支付。
-                              </DialogDescription>
                             </DialogHeader>
                             <div className="flex min-h-0 flex-col gap-4 overflow-y-auto" data-qr-dialog-body>
                               <p className="text-center text-2xl font-semibold tabular-nums">
@@ -397,6 +394,9 @@ export function CheckoutApp({ initial }: { initial: CheckoutInitial }) {
                                 alt="放大的支付宝付款二维码"
                                 data-qr-dialog-image
                               />
+                              <DialogDescription className="shrink-0 leading-relaxed">
+                                <ExactAmountNotice />勿重复支付。
+                              </DialogDescription>
                             </div>
                           </DialogContent>
                         </Dialog>
