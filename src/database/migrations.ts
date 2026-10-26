@@ -5013,4 +5013,14 @@ export const migrations: readonly Migration[] = [
     `,
   },
   { version: 36, name: "bidirectional_amount_offsets", sql: AMOUNT_OFFSET_SCHEMA_SQL },
+  {
+    version: 37,
+    name: "administrator_login_session_metadata",
+    sql: `
+      ALTER TABLE admin_sessions ADD COLUMN user_agent TEXT
+        CHECK (user_agent IS NULL OR length(CAST(user_agent AS BLOB)) BETWEEN 1 AND 1024);
+      ALTER TABLE admin_sessions ADD COLUMN source_address TEXT
+        CHECK (source_address IS NULL OR length(source_address) BETWEEN 1 AND 45);
+    `,
+  },
 ] as const;

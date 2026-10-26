@@ -8,7 +8,7 @@ import { siteChoiceLabel } from "@/lib/site-choice-label";
 import { Link } from "@/navigation";
 import { SiteAmountBar } from "@/components/site-amount-bar";
 import { ErrorNotice } from "@/components/request-state";
-import { Empty, EmptyHeader, EmptyTitle, EmptyDescription } from "@/components/admin-empty";
+import { Empty, EmptyHeader, EmptyTitle } from "@/components/admin-empty";
 import { Badge } from "@/components/ui/badge";
 import { Button, buttonVariants } from "@/components/ui/button";
 import {
@@ -127,15 +127,16 @@ export function SiteManagementCards() {
               setSearch(next, { replace: true });
             }}
             variant="outline" size="sm" spacing={0} aria-label="经营统计周期"
+            className="site-management-periods min-w-0 max-w-full items-stretch"
           >
-            {[7, 30, 90].map((days) => <ToggleGroupItem key={days} value={String(days)}>近 {days} 天</ToggleGroupItem>)}
+            {[7, 30, 90].map((days) => <ToggleGroupItem key={days} value={String(days)} className="site-management-period h-auto min-h-7 min-w-0 flex-1 shrink whitespace-normal">近 {days} 天</ToggleGroupItem>)}
           </ToggleGroup>
           <Popover>
             <PopoverTrigger render={<Button variant="ghost" size="icon-sm" aria-label="网站经营指标说明" />}><Info /></PopoverTrigger>
             <PopoverContent align="start" className="flex flex-col gap-2">
-              <p>实收与收款确认笔数按北京时间内的PerPay 确认时间统计，不扣除退款或费用；今天尚未结束。</p>
+              <p>实收与确认笔数按北京时间的 PerPay 确认时间统计，未扣退款和费用；今天尚未结束。</p>
               {latest && <p>统计区间：<time dateTime={latest.period.from}>{latest.period.from}</time> 至 <time dateTime={latest.period.to}>{latest.period.to}</time>。</p>}
-              <p>横条以全部网站中本期实收最高者为满格，包含暂停接单的网站，不受分页影响。待付款与待处理为当前数量。</p>
+              <p>横条以全站本期最高实收为基准，含暂停接单网站，不受分页影响。待付款与待处理为当前数量。</p>
             </PopoverContent>
           </Popover>
         </div>
@@ -162,7 +163,7 @@ export function SiteManagementCards() {
             </ul>
           ) : (
             <Empty>
-              <EmptyHeader><EmptyTitle>暂无网站</EmptyTitle><EmptyDescription>创建业务网站后，在这里查看经营概况和管理设置。</EmptyDescription></EmptyHeader>
+              <EmptyHeader><EmptyTitle>暂无网站</EmptyTitle></EmptyHeader>
             </Empty>
           )}
           {query.isFetchNextPageError ? <ErrorNotice error={query.error} retry={loadMore} /> : query.hasNextPage && (

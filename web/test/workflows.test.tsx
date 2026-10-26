@@ -29,9 +29,11 @@ import {
   order,
   orderId,
   settings,
+  withSessionList,
 } from "./fixtures";
 
 function renderPage(children: ReactNode, path = "/") {
+  vi.stubGlobal("fetch", withSessionList(globalThis.fetch));
   // This suite tests other security controls; keep the read-only IP lookup cached.
   queryClient.setQueryData(["admin-access-source"], {data:{revision:settings.revision,...settings.admin_access,current_ip:"192.0.2.1"}});
 
@@ -493,7 +495,7 @@ describe("operation dialog layout", () => {
       expect(dialog).toHaveAccessibleDescription(
         kind === "reason"
           ? "仅撤销账务关联，不会转出资金。"
-          : "将这笔支付宝收入关联到订单，并确认订单收款。",
+          : "关联支付宝收入后确认订单收款。",
       );
       const user = userEvent.setup();
       await user.type(reason, "核对长文本证据");
@@ -818,7 +820,7 @@ describe("state-changing workflows", () => {
     );
     expect(
       screen.getByText(
-        "60 秒后或离开当前浏览器标签页时，弹窗会关闭并清除页面中的密钥明文；服务端密钥不受影响，可再次查看。",
+        "60 秒后或离开此标签页时，弹窗关闭并清除页面明文；密钥仍可再次查看。",
       ),
     ).toBeVisible();
     expect(await screen.findByText("ephemeral-test-secret")).toBeVisible();

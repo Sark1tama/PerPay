@@ -285,7 +285,10 @@ describe("checkout desktop composition", () => {
     expect(container.querySelectorAll("[data-countdown]")).toHaveLength(1);
     expect(
       summary.querySelector("[data-checkout-desktop-guide]"),
-    ).toHaveTextContent("支付宝扫码");
+    ).toHaveTextContent("请支付左侧显示的精确金额，不要四舍五入！否则支付宝可能无法匹配订单。");
+    expect(container.querySelector("[data-checkout-mobile-guide]")).toHaveTextContent(
+      "请支付页面显示的精确金额，不要四舍五入！否则支付宝可能无法匹配订单。",
+    );
   });
   it("keeps the same QR and in-flight read while resizing instead of mounting another checkout", async () => {
     const { fetch: read, finish } = pendingFetch();

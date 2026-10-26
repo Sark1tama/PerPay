@@ -219,7 +219,7 @@ it("upgrades existing open and closed orders without changing their financial sn
     current = await AppDatabase.open(legacy.config.databasePath, { masterKey: legacy.config.masterKey });
     const after = tables.map(table => current!.read(db => db.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all()));
     assert.deepEqual(after, before);
-    assert.equal(current.read(db => db.prepare("SELECT max(version) AS n FROM schema_migrations").get()!.n), 36n);
+    assert.equal(current.read(db => db.prepare("SELECT max(version) AS n FROM schema_migrations").get()!.n), 37n);
     assert.equal(current.integrityCheck().ok, true);
     const backup = join(directory, "backup.sqlite3");
     await current.backup(backup);

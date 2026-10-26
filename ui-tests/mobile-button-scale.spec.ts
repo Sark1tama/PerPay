@@ -1,6 +1,6 @@
 import type { Locator, Page } from "@playwright/test";
 import { test, expect, login, record } from "./fixtures";
-import { expectTouchTarget, tapOutsideVisible } from "./touch-targets";
+import { expectTouchGap, expectTouchSlot, expectTouchTarget, tapOutsideVisible } from "./touch-targets";
 
 async function centered(target: Locator, page: Page) {
   await target.evaluate(element => element.scrollIntoView({ block: "center", inline: "nearest" }));
@@ -8,52 +8,62 @@ async function centered(target: Locator, page: Page) {
   return expectTouchTarget(target);
 }
 
+async function tapMenuItemEdge(page: Page, target: Locator) {
+  const geometry = await expectTouchTarget(target);
+  expect(geometry.visual.height).toBeCloseTo(40, 1);
+  expect(geometry.generated, "menu rows use their own complete touch area").toBe(false);
+  const point = { x: geometry.visual.x + geometry.visual.width / 2, y: geometry.visual.y + 1 };
+  expect(await target.evaluate((element, point) => {
+    const hit = document.elementFromPoint(point.x, point.y);
+    return hit !== null && (hit === element || element.contains(hit));
+  }, point)).toBe(true);
+  await page.touchscreen.tap(point.x, point.y);
+  return { geometry, point };
+}
+
 test.describe("compact mobile button visuals and separate touch targets", () => {
   test.use({ hasTouch: true, isMobile: true, viewport: { width: 360, height: 560 }, reducedMotion: "reduce" });
 
   for (const width of [320, 360, 390, 430]) {
-    test(`${width}px: settings page actions keep their complete touch regions at the scroll start`, async ({ page, manifest }, info) => {
+    test(`${width}px: settings page menu rows use compact 40px touch areas`, async ({ page, manifest }, info) => {
       await page.setViewportSize({ width, height: 560 });
       await login(page, manifest);
       await page.goto(manifest.origin + "/admin/settings/display");
       const more = page.getByRole("button", { name: "页面操作", exact: true });
       await more.click();
-      const actions = page.getByRole("dialog", { name: "页面操作", exact: true });
-      await expect(actions).toBeVisible();
-      await page.clock.runFor(250);
-      await expect.poll(() => actions.evaluate(element =>
-        element.getAnimations().every(animation => animation.playState === "finished"),
-      )).toBe(true);
-      const scroller = actions.locator("[data-header-mobile-actions]");
-      const wizard = actions.getByRole("link", { name: "配置向导", exact: true });
-      const refresh = actions.getByRole("button", { name: "刷新", exact: true });
+      const actions = page.getByRole("menu", { name: "页面操作", exact: true });
+      const wizard = actions.getByRole("menuitem", { name: "配置向导", exact: true });
+      const refresh = actions.getByRole("menuitem", { name: "刷新", exact: true });
       await expect(refresh).toBeEnabled();
-      await expect.poll(() => scroller.evaluate(element => element.scrollTop)).toBe(0);
+      await expect.poll(() => actions.evaluate(element => element.scrollTop)).toBe(0);
 
-      // Measure before scrolling: the first action's extension must fit inside
-      // the scroller, and stacked actions must not claim the same tap points.
       const wizardGeometry = await expectTouchTarget(wizard);
       const refreshGeometry = await expectTouchTarget(refresh);
-      expect(wizardGeometry.visual.height).toBeCloseTo(36, 1);
-      expect(refreshGeometry.visual.height).toBeCloseTo(36, 1);
-      expect(wizardGeometry.y + wizardGeometry.height).toBeLessThanOrEqual(refreshGeometry.y);
+      for (const geometry of [wizardGeometry, refreshGeometry]) {
+        expect(geometry.visual.height).toBeCloseTo(40, 1);
+        expect(geometry.generated).toBe(false);
+      }
+      expect(refreshGeometry.y).toBeGreaterThanOrEqual(wizardGeometry.y + wizardGeometry.height - .5);
 
       const response = page.waitForResponse(response => response.request().method() === "GET" &&
         new URL(response.url()).pathname === "/api/admin/v1/settings");
-      const refreshTap = await tapOutsideVisible(page, refresh, "top");
+      const refreshTap = await tapMenuItemEdge(page, refresh);
       await response;
+      await expect(actions).toHaveCount(0);
+      await expect(more).toBeFocused();
+      await more.click();
       await expect(refresh).toBeEnabled();
       await expect(actions).toBeVisible();
       await expect(page).toHaveURL(manifest.origin + "/admin/settings/display");
       await record(page, info, { evidence: "browser touch viewport", buttonScale: { requestedWidth: width, wizardGeometry, refreshGeometry, refreshTap } });
 
-      const wizardTap = await tapOutsideVisible(page, wizard, "top");
+      const wizardTap = await tapMenuItemEdge(page, wizard);
       await expect(page.locator("[data-onboarding-workspace]")).toBeVisible();
       await expect(actions).toHaveCount(0);
       await info.attach("settings-wizard-edge-tap", { body: Buffer.from(JSON.stringify(wizardTap, null, 2)), contentType: "application/json" });
     });
 
-    test(`${width}px: toolbar, display controls and checkout use compact visuals with 44px touch regions`, async ({ page, manifest }, info) => {
+    test(`${width}px: toolbar, display controls and checkout use compact visuals with 40px touch slots`, async ({ page, manifest }, info) => {
       await page.setViewportSize({ width, height: 560 });
       await login(page, manifest);
       await page.goto(manifest.origin + "/admin/orders");
@@ -63,18 +73,18 @@ test.describe("compact mobile button visuals and separate touch targets", () => 
       const filter = page.getByRole("button", { name: "筛选与排序", exact: true });
       const more = page.getByRole("button", { name: "更多订单操作", exact: true });
       await expect(search).toBeVisible();
-      const searchGeometry = await expectTouchTarget(search);
-      const filterGeometry = await expectTouchTarget(filter);
-      const moreGeometry = await expectTouchTarget(more);
-      expect(searchGeometry.visual.height).toBeCloseTo(40, 1);
-      expect(filterGeometry.visual.height).toBeCloseTo(36, 1);
-      expect(moreGeometry.visual.height).toBeCloseTo(36, 1);
-      expect(moreGeometry.visual.width).toBeCloseTo(36, 1);
-      expect(filterGeometry.x + filterGeometry.width).toBeLessThanOrEqual(moreGeometry.x);
+      const searchGeometry = await expectTouchSlot(search);
+      const filterGeometry = await expectTouchSlot(filter);
+      const moreGeometry = await expectTouchSlot(more);
+      expect(searchGeometry.visual.height).toBeCloseTo(36, 1);
+      expect(filterGeometry.visual.height).toBeCloseTo(32, 1);
+      expect(moreGeometry.visual.height).toBeCloseTo(32, 1);
+      expect(moreGeometry.visual.width).toBeCloseTo(32, 1);
+      await expectTouchGap(filter, more, "horizontal");
 
       // The input-group action retains its own layout space beside the editable input.
       const modeGeometry = await expectTouchTarget(mode);
-      expect(modeGeometry.visual.height).toBeGreaterThanOrEqual(44);
+      expect(modeGeometry.visual.height).toBeCloseTo(40, 1);
       const inputBox = (await keyword.boundingBox())!;
       const inputPoint = { x: inputBox.x + 3, y: inputBox.y + inputBox.height / 2 };
       expect(await keyword.evaluate((element, point) => document.elementFromPoint(point.x, point.y) === element, inputPoint)).toBe(true);
@@ -93,7 +103,7 @@ test.describe("compact mobile button visuals and separate touch targets", () => 
       await expect(filters).toBeVisible();
       await expect(page.getByRole("menu")).toHaveCount(0);
       const filterClose = filters.getByRole("button", { name: "关闭对话框", exact: true });
-      expect((await expectTouchTarget(filterClose)).visual.height).toBeCloseTo(36, 1);
+      expect((await expectTouchTarget(filterClose)).visual.height).toBeCloseTo(32, 1);
       await tapOutsideVisible(page, filterClose, "left");
       await expect(filters).toHaveCount(0);
       await expect(filter).toBeFocused();
@@ -108,9 +118,9 @@ test.describe("compact mobile button visuals and separate touch targets", () => 
       const comfortable = density.getByRole("button", { name: "舒适", exact: true });
       const compactGeometry = await centered(compact, page);
       const comfortableGeometry = await expectTouchTarget(comfortable);
-      expect(compactGeometry.visual.height).toBeCloseTo(36, 1);
-      expect(comfortableGeometry.visual.height).toBeCloseTo(36, 1);
-      expect(compactGeometry.x + compactGeometry.width).toBeLessThanOrEqual(comfortableGeometry.x);
+      expect(compactGeometry.visual.height).toBeCloseTo(32, 1);
+      expect(comfortableGeometry.visual.height).toBeCloseTo(32, 1);
+      await expectTouchGap(compact, comfortable, "horizontal");
       await tapOutsideVisible(page, comfortable, "top");
       await expect(comfortable).toHaveAttribute("aria-pressed", "true");
       await expect(compact).toHaveAttribute("aria-pressed", "false");
@@ -119,7 +129,7 @@ test.describe("compact mobile button visuals and separate touch targets", () => 
       await expect(comfortable).toHaveAttribute("aria-pressed", "false");
       const done = display.getByRole("button", { name: "完成", exact: true });
       const doneGeometry = await centered(done, page);
-      expect(doneGeometry.visual.height).toBeCloseTo(40, 1);
+      expect(doneGeometry.visual.height).toBeCloseTo(36, 1);
       await done.click();
       await expect(display).toHaveCount(0);
       await expect(more).toBeFocused();
@@ -134,14 +144,14 @@ test.describe("compact mobile button visuals and separate touch targets", () => 
       const query = page.getByRole("button", { name: "查询付款状态", exact: true });
       const enlarge = page.getByRole("button", { name: "放大二维码", exact: true });
       const save = page.getByRole("button", { name: "保存二维码", exact: true });
-      const queryGeometry = await expectTouchTarget(query);
-      const enlargeGeometry = await expectTouchTarget(enlarge);
-      const saveGeometry = await expectTouchTarget(save);
-      expect(queryGeometry.visual.height).toBeCloseTo(40, 1);
-      expect(enlargeGeometry.visual.height).toBeCloseTo(36, 1);
-      expect(saveGeometry.visual.height).toBeCloseTo(36, 1);
+      const queryGeometry = await expectTouchSlot(query);
+      const enlargeGeometry = await expectTouchSlot(enlarge);
+      const saveGeometry = await expectTouchSlot(save);
+      expect(queryGeometry.visual.height).toBeCloseTo(36, 1);
+      expect(enlargeGeometry.visual.height).toBeCloseTo(32, 1);
+      expect(saveGeometry.visual.height).toBeCloseTo(32, 1);
       expect(queryGeometry.y + queryGeometry.height).toBeLessThanOrEqual(560);
-      expect(enlargeGeometry.x + enlargeGeometry.width).toBeLessThanOrEqual(saveGeometry.x);
+      await expectTouchGap(enlarge, save, "horizontal");
       const download = page.waitForEvent("download");
       const saveTap = await tapOutsideVisible(page, save, "bottom");
       await download;
@@ -165,7 +175,7 @@ test.describe("compact mobile button visuals and separate touch targets", () => 
     const geometry = [];
     for (const choice of choices) {
       const target = await expectTouchTarget(choice);
-      expect(target.visual.height).toBeCloseTo(44, 1);
+      expect(target.visual.height).toBeCloseTo(40, 1);
       expect(target.x).toBeCloseTo(target.visual.x, 1);
       expect(target.width).toBeCloseTo(target.visual.width, 1);
       for (const x of [target.visual.x + 2, target.visual.x + target.visual.width - 2]) {
@@ -203,16 +213,27 @@ test.describe("compact mobile button visuals and separate touch targets", () => 
     await view.click();
     const dialog = page.getByRole("dialog", { name: "支付宝公钥", exact: true });
     await expect(dialog.getByRole("textbox", { name: "密钥内容", exact: true })).toHaveValue(syntheticPublicKey);
-    const body = dialog.locator("[data-admin-dialog-body]");
+    const body = dialog.locator("[data-admin-dialog-scroll]");
     await expect.poll(() => body.evaluate(element => element.scrollTop)).toBe(0);
     const copy = dialog.getByRole("button", { name: "复制支付宝公钥", exact: true });
-    const copyGeometry = await expectTouchTarget(copy);
-    expect(copyGeometry.visual.height).toBeCloseTo(36, 1);
+    await dialog.getByRole("textbox", { name: "密钥内容", exact: true }).focus();
+    await page.keyboard.press("Shift+Tab");
+    await expect(copy).toBeFocused();
+    await copy.hover();
+    await page.clock.runFor(200);
+    const tooltip = page.locator('[data-slot="tooltip-content"]').filter({ hasText: /^复制支付宝公钥$/ });
+    await expect(tooltip).toBeVisible();
+    const copyGeometry = await expectTouchSlot(copy);
+    const tooltipBounds = (await tooltip.boundingBox())!;
+    const overlapWidth = Math.min(copyGeometry.x + copyGeometry.width, tooltipBounds.x + tooltipBounds.width) - Math.max(copyGeometry.x, tooltipBounds.x);
+    const overlapHeight = Math.min(copyGeometry.y + copyGeometry.height, tooltipBounds.y + tooltipBounds.height) - Math.max(copyGeometry.y, tooltipBounds.y);
+    expect(overlapWidth <= 0 || overlapHeight <= 0, "the open tooltip stays outside the complete 40px copy touch target").toBe(true);
+    expect(copyGeometry.visual.height).toBeCloseTo(32, 1);
     const bodyBox = (await body.boundingBox())!;
     expect(copyGeometry.y).toBeGreaterThanOrEqual(bodyBox.y);
     const copyTap = await tapOutsideVisible(page, copy, "top");
     await expect(dialog.getByRole("status")).toHaveText("已复制");
-    await record(page, info, { evidence: "browser touch viewport with synthetic public-key reveal and clipboard", buttonScale: { copyGeometry, copyTap } });
+    await record(page, info, { evidence: "browser touch viewport with synthetic public-key reveal and clipboard", buttonScale: { copyGeometry, copyTap, tooltipBounds } });
     await dialog.getByRole("button", { name: "关闭", exact: true }).click();
     await expect(dialog).toHaveCount(0);
     await expect(view).toBeFocused();

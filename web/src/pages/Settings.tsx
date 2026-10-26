@@ -1,6 +1,6 @@
 import { Alert, AlertTitle, AlertDescription } from "@/components/ui/alert";
 import { RefreshButton } from "@/components/refresh-button";
-import { PageHeaderActions } from "@/components/page-header-actions";
+import { PageHeaderActionLink, PageHeaderActions } from "@/components/page-header-actions";
 import { useEffect, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import {
@@ -104,7 +104,7 @@ export default function Settings() {
   return (
     <div className="admin-settings-layout @container/settings flex w-full min-w-0 flex-col gap-6" data-settings-section={requestedSection}>
       <PageHeaderActions>
-        <Link
+        <PageHeaderActionLink><Link
           className={buttonVariants({ variant: "ghost", size: "sm" })}
           to="/settings/onboarding"
           aria-label="配置向导"
@@ -112,13 +112,13 @@ export default function Settings() {
         >
           <Settings2 data-icon="inline-start" />
           <span className="hidden sm:inline">配置向导</span>
-        </Link>
+        </Link></PageHeaderActionLink>
         <RefreshButton disabled={settings.isFetching} onClick={refresh} busy={settings.isFetching} />
       </PageHeaderActions>
-      <PageHeading title="系统设置" description="支付宝接入、经营码、查账、通知、安全、备份和界面设置。" />
+      <PageHeading title="系统设置" />
       <QueryView query={settings}>
         {({ data }) => {
-          if (data.site_mode && requestedSection === "notifications") return <Alert><AlertTitle>通知设置已迁移</AlertTitle><AlertDescription>每个网站分别配置通知地址前缀、签名密钥和投递策略。<Link to="/sites">前往业务网站</Link></AlertDescription></Alert>;
+          if (data.site_mode && requestedSection === "notifications") return <Alert><AlertTitle>通知设置已迁移</AlertTitle><AlertDescription><Link to="/sites">前往业务网站配置通知</Link></AlertDescription></Alert>;
           const availableSections = data.site_mode ? sections.filter(([value]) => value !== "notifications") : sections;
           const section =
             availableSections.find(([value]) => value === requestedSection)?.[0] ??

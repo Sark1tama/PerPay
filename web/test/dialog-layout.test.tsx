@@ -11,7 +11,7 @@ import {
   SecuritySettings,
 } from "../src/pages/SecuritySettings";
 import { recordAction } from "./menu-helper";
-import { json, settings } from "./fixtures";
+import { json, settings, withSessionList } from "./fixtures";
 
 const longValue = [
   "-----BEGIN PRIVATE KEY-----",
@@ -104,7 +104,7 @@ describe("bounded secret content", () => {
       expect(body).not.toContainElement(footer);
       expect(textbox).toHaveValue(longValue);
       expect(dialog).toHaveAccessibleDescription(
-        "60 秒后或离开当前浏览器标签页时，弹窗会关闭并清除页面中的密钥明文；服务端密钥不受影响，可再次查看。",
+        "60 秒后或离开此标签页时，弹窗关闭并清除页面明文；密钥仍可再次查看。",
       );
       await user.click(
         within(footer).getByRole("button", {
@@ -121,7 +121,7 @@ it("bounds the session confirmation without changing its cancel behavior", async
   queryClient.setQueryData(["admin-access-source"], {data:{revision:settings.revision,...settings.admin_access,current_ip:"192.0.2.1"}});
 
   const fetchMock = vi.fn();
-  vi.stubGlobal("fetch", fetchMock);
+  vi.stubGlobal("fetch", withSessionList(fetchMock));
   render(
     <QueryClientProvider client={queryClient}>
       <MemoryRouter>

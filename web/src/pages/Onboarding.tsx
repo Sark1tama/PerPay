@@ -1,5 +1,5 @@
 import { RefreshButton } from "@/components/refresh-button";
-import { PageHeaderActions } from "@/components/page-header-actions";
+import { PageHeaderActionLink, PageHeaderActions } from "@/components/page-header-actions";
 import { useSystemName } from "@/branding";
 import { TestPaymentButton } from "@/components/test-payment-provider";
 import { useEffect, useRef, useState, type ReactNode } from "react";
@@ -102,7 +102,7 @@ export default function Onboarding() {
       data-onboarding-workspace
     >
       <PageHeaderActions>
-        <a
+        <PageHeaderActionLink><a
           data-external-link
           className={buttonVariants({ variant: "ghost", size: "sm" })}
           href="https://github.com/Mashiro0619/PerPay/blob/main/docs/alipay-setup.md"
@@ -113,7 +113,7 @@ export default function Onboarding() {
         >
           <BookOpen data-icon="inline-start" />
           <span className="hidden sm:inline">图文教程</span>
-        </a>
+        </a></PageHeaderActionLink>
         <RefreshButton disabled={
             refreshing ||
             settings.isFetching ||
@@ -125,9 +125,6 @@ export default function Onboarding() {
             instance.isFetching ||
             readinessFetching} />
       </PageHeaderActions>
-      <p className="text-sm text-muted-foreground">
-        按步骤完成收款配置，已有配置可直接复用。
-      </p>
       <ErrorNotice
         error={instance.error}
         retry={() => {
@@ -238,7 +235,7 @@ function OnboardingFlow({
               <AlertTitle>新应用公钥尚未启用</AlertTitle>
               <AlertDescription className="min-w-0">
                 {systemName}{" "}
-                当前仍使用原密钥，其他配置可以继续修改。若已在支付宝上传新公钥，请尽快完成验证启用，避免影响查账。
+                当前仍使用原密钥。若已在支付宝上传新公钥，请尽快验证启用，以免影响查账。
               </AlertDescription>
               <div className="col-start-2 flex flex-wrap gap-2 pt-2">
                 <Link
@@ -254,11 +251,9 @@ function OnboardingFlow({
             <OnboardingStepLayout
               help={
                 <OnboardingHelp title="公钥与私钥">
-                  <p>应用公钥和应用私钥是一对，合称“应用密钥对”。</p>
                   <p>应用公钥：复制到支付宝的接口加签设置。</p>
                   <p>
-                    应用私钥：由 {systemName}{" "}
-                    加密保存，用于向支付宝发送签名请求。
+                    应用私钥：保存在 {systemName}，不要上传到支付宝。
                   </p>
                   <p>
                     {pendingApplicationKey
@@ -357,14 +352,13 @@ function OnboardingFlow({
                         ）。 {systemName} 当前仍使用原密钥。
                       </p>
                       <p>
-                        上传完成后，将支付宝页面显示的支付宝公钥填入本页表单。
-                        点击“验证并启用后继续”，通过验证后即可进入下一步。
+                        上传后，将支付宝页面显示的支付宝公钥填入表单。
                       </p>
                     </>
                   ) : (
                     <p>
                       将同一应用的 App ID
-                      和支付宝公钥填入表单。生产收款使用生产环境；查账参数可保留当前值。
+                      和支付宝公钥填入表单。生产收款使用生产环境。
                     </p>
                   )}
                   {(pendingApplicationKey?.public_key ||
@@ -439,7 +433,7 @@ function OnboardingFlow({
               help={
                 <OnboardingHelp title="确认经营码">
                   <p>
-                    使用本系统共用的支付宝经营码。上传图片后先核对识别内容，也可直接粘贴经营码内容。
+                    经营码由所有业务网站共用。上传后请核对识别内容。
                   </p>
                   <p>
                     金额调整用于区分订单。付款人需要按收银台显示的应付金额付款。
@@ -538,22 +532,22 @@ function OnboardingFooter({
 }) {
   const deferredState = { deferOnboardingFor: instanceId };
   return (
-    <footer className="flex min-w-0 flex-col gap-3" data-onboarding-actions>
+    <footer className="flex min-w-0 flex-col gap-3 @max-3xl/onboarding:[&_:is(a,button)]:h-auto @max-3xl/onboarding:[&_:is(a,button)]:min-h-8 @max-3xl/onboarding:[&_:is(a,button)]:max-w-full @max-3xl/onboarding:[&_:is(a,button)]:whitespace-normal" data-onboarding-actions>
       <Separator />
       <div
-        className="flex min-w-0 flex-wrap items-start justify-between gap-3"
+        className="flex min-w-0 flex-col items-stretch gap-3 @3xl/onboarding:flex-row @3xl/onboarding:items-start @3xl/onboarding:justify-between"
         data-onboarding-primary-actions
       >
         {index > 0 && (
           <Link
-            className={buttonVariants({ variant: "outline" })}
+            className={buttonVariants({ variant: "outline", className: "self-start" })}
             to={onboardingPath(onboardingSteps[index - 1]!.id)}
           >
             上一步
           </Link>
         )}
         <div
-          className="ml-auto flex min-w-0 flex-1 flex-wrap items-center justify-end gap-2"
+          className="flex w-full min-w-0 flex-wrap items-center gap-3 @3xl/onboarding:ml-auto @3xl/onboarding:w-auto @3xl/onboarding:flex-1 @3xl/onboarding:justify-end"
           data-onboarding-next
         >
           {children}
@@ -597,7 +591,7 @@ function OptionalSettings({
         className="grid min-w-0 items-start gap-5 @3xl/onboarding:grid-cols-2"
         data-onboarding-optional
       >
-        {settings.site_mode ? <section className="flex flex-col gap-3"><h3 className="font-medium">业务网站（必需）</h3><p>先创建至少一个业务网站，为它配置独立的订单策略、展示、API 与通知密钥。系统共用经营码与查账对账，不需要为测试收款先签发 API 密钥。</p><div className="flex flex-wrap gap-2"><Link to="/sites/new" className={buttonVariants()}>创建业务网站</Link><Link to="/sites" className={buttonVariants({ variant: "outline" })}>管理业务网站</Link></div></section> : <>
+        {settings.site_mode ? <section className="flex flex-col gap-3"><h3 className="font-medium">业务网站（必需）</h3><p>各网站独立配置订单规则和接入密钥，共用经营码与查账。测试收款无需先签发 API 密钥。</p><div className="flex flex-wrap gap-2"><Link to="/sites/new" className={buttonVariants()}>创建业务网站</Link><Link to="/sites" className={buttonVariants({ variant: "outline" })}>管理业务网站</Link></div></section> : <>
         <section
           className="flex min-w-0 flex-col gap-3"
           aria-labelledby="onboarding-notifications-title"
@@ -657,7 +651,6 @@ export function ReadinessCheck({
   /** The full wizard refreshes settings and remounts this check from its header. */
   showRefresh?: boolean;
 }) {
-  const systemName = useSystemName();
   const view = useVisibleCheck();
   const query = useQuery({
     queryKey: [
@@ -781,7 +774,7 @@ export function ReadinessCheck({
   const runtimeWarnings =
     ready && status ? onboardingRuntimeWarnings(status) : [];
   const actions = (
-    <div className="flex flex-wrap items-center gap-2">
+    <div className="flex min-w-0 max-w-full flex-wrap items-center gap-3">
       {ready && (
         <>
           <Link className={buttonVariants()} to="/">
@@ -867,7 +860,7 @@ export function ReadinessCheck({
       {runtimeWarnings.length > 0 && (
         <Alert role="status" data-onboarding-runtime-warnings>
           <CircleAlert />
-          <AlertTitle>运行提醒（不是配置缺项）</AlertTitle>
+          <AlertTitle>运行提醒</AlertTitle>
           <AlertDescription className="min-w-0">
             <ul className="record-list-meta flex list-inside list-disc flex-col gap-1 break-words">
               {runtimeWarnings.map((warning) => (
@@ -896,8 +889,7 @@ export function ReadinessCheck({
       )}
       {!settings.site_mode && !settings.notifications?.enabled && (
         <p className="text-sm text-muted-foreground">
-          通知未启用（可选），不影响收款；业务系统后端需主动向 {systemName}{" "}
-          查询订单状态。
+          通知未启用，不影响收款；业务系统需主动查询订单状态。
         </p>
       )}
       {renderActions ? renderActions(actions) : actions}

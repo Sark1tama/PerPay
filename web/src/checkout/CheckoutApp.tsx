@@ -42,6 +42,15 @@ import {
 import { createCheckoutController } from "./controller";
 import { useQrDownload } from "./use-qr-download";
 import { AlipayLogo } from "./AlipayLogo";
+
+function ExactAmountNotice({ desktop = false }: { desktop?: boolean }) {
+  return <>
+    请支付{desktop ? "左侧" : "页面"}显示的
+    <strong className="font-semibold text-red-600 dark:text-red-400">精确金额</strong>
+    ，不要四舍五入！否则支付宝可能无法匹配订单。
+  </>;
+}
+
 export function CheckoutApp({ initial }: { initial: CheckoutInitial }) {
   const [controller] = useState(() => createCheckoutController(initial));
   const state = useSyncExternalStore(
@@ -373,7 +382,7 @@ export function CheckoutApp({ initial }: { initial: CheckoutInitial }) {
                             <DialogHeader className="shrink-0 pr-12">
                               <DialogTitle>支付宝付款二维码</DialogTitle>
                               <DialogDescription>
-                                请按此金额付款，勿重复支付。
+                                <ExactAmountNotice />勿重复支付。
                               </DialogDescription>
                             </DialogHeader>
                             <div className="flex min-h-0 flex-col gap-4 overflow-y-auto" data-qr-dialog-body>
@@ -422,6 +431,14 @@ export function CheckoutApp({ initial }: { initial: CheckoutInitial }) {
             )}
           </div>
           {actions}
+          {canPay && (
+            <p
+              className="mx-4 rounded-md border border-red-200 bg-red-50 p-3 text-sm leading-relaxed dark:border-red-900 dark:bg-red-950/30 lg:hidden"
+              data-checkout-mobile-guide
+            >
+              <ExactAmountNotice />
+            </p>
+          )}
           {order && (
             <>
               <div className="px-4 lg:hidden">
@@ -476,7 +493,7 @@ export function CheckoutApp({ initial }: { initial: CheckoutInitial }) {
                       className="hidden text-sm leading-relaxed text-muted-foreground lg:block"
                       data-checkout-desktop-guide
                     >
-                      用支付宝扫码，核对收款方并按准确金额付款。
+                      <ExactAmountNotice desktop />
                     </p>
                   )}
                 </CardContent>

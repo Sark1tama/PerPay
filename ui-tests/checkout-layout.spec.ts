@@ -13,10 +13,20 @@ test("checkout keeps one query before order information on phones and scales the
     });
     expect(bounds.qr.width).toBe(width! >= 1280 ? 320 : width! >= 1024 ? 288 : Math.max(180, Math.min(height! - 360, 240)));
     if (width! < 1024) {
+      const guide = page.locator("[data-checkout-mobile-guide]");
+      await expect(guide).toBeVisible();
+      await expect(guide).toContainText("请支付页面显示的精确金额，不要四舍五入！否则支付宝可能无法匹配订单。");
+      await expect(page.locator("[data-checkout-desktop-guide]")).toBeHidden();
+      const guideBox = (await guide.boundingBox())!;
+      expect(guideBox.y).toBeGreaterThanOrEqual(bounds.actions.bottom);
+      expect(guideBox.y + guideBox.height).toBeLessThanOrEqual(bounds.summary.y);
       expect(bounds.amount.y).toBeLessThan(bounds.qr.y);
       expect(bounds.actions.bottom).toBeLessThanOrEqual(bounds.summary.y);
       if (width === 360 && height === 560 || width === 390 && height === 664) expect((await query.boundingBox())!.y + (await query.boundingBox())!.height).toBeLessThanOrEqual(height!);
     } else {
+      await expect(page.locator("[data-checkout-desktop-guide]")).toContainText("请支付左侧显示的精确金额，不要四舍五入！否则支付宝可能无法匹配订单。");
+      await expect(page.locator("[data-checkout-desktop-guide]")).toBeVisible();
+      await expect(page.locator("[data-checkout-mobile-guide]")).toBeHidden();
       expect(bounds.summary.x).toBeGreaterThan(bounds.qr.x);
       expect(bounds.card.width).toBe(Math.min(width! >= 1280 ? 1152 : 1024, width!) - 48);
     }
@@ -28,6 +38,7 @@ test("checkout keeps one query before order information on phones and scales the
   await page.getByRole("button", { name: "放大二维码" }).click();
   const dialog = page.getByRole("dialog", { name: "支付宝付款二维码" });
   await expect(dialog).toBeVisible();
+  await expect(dialog).toContainText("精确金额，不要四舍五入！否则支付宝可能无法匹配订单。");
   await expect(dialog.locator("p").filter({ hasText: "¥" })).toHaveCount(1);
   expect((await dialog.boundingBox())!.height).toBeLessThanOrEqual(528);
   const title = dialog.getByRole("heading", { name: "支付宝付款二维码" });

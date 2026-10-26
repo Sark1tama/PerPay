@@ -1,5 +1,6 @@
 import { Link } from "@/navigation";
 import { AdminAccessSettings } from "./AdminAccessSettings";
+import { AdministratorSessions } from "@/components/administrator-sessions";
 import { DialogBody } from "@/components/admin-dialog";
 import { useSystemName } from "@/branding";
 import {
@@ -24,7 +25,7 @@ import {
   MIN_ADMIN_PASSWORD_CHARACTERS,
   validatePassword,
 } from "@/lib/format";
-import { useDirtyDraft, useDraftGuard } from "@/drafts";
+import { useDirtyDraft } from "@/drafts";
 import { CopyValue } from "@/components/copy-value";
 import { StatusBadge } from "@/components/business-status";
 import { ListDateTime } from "@/components/list-primitives";
@@ -46,7 +47,6 @@ import {
   CardHeader,
   CardTitle,
   CardDescription,
-  CardAction,
   CardContent,
   CardFooter,
 } from "@/components/ui/card";
@@ -84,7 +84,7 @@ import {
   DropdownMenuItem,
 } from "@/components/ui/dropdown-menu";
 export const SECRET_DISPLAY_NOTICE =
-  "60 秒后或离开当前浏览器标签页时，弹窗会关闭并清除页面中的密钥明文；服务端密钥不受影响，可再次查看。";
+  "60 秒后或离开此标签页时，弹窗关闭并清除页面明文；密钥仍可再次查看。";
 
 export function SecuritySettings({
   settings,
@@ -104,18 +104,10 @@ export function SecuritySettings({
     ["provider_private_key", "应用私钥", `${systemName} 请求支付宝`],
     ["provider_public_key", "支付宝公钥", "验证支付宝返回的数据"],
   ];
-  const { requestDiscard } = useDraftGuard();
   const [reveal, setReveal] = useState<RuntimeSecretName | null>(null);
   const [rotate, setRotate] = useState(false);
-  const [revoke, setRevoke] = useState(false);
-  const session = useSession();
   const dialogOrigin = useRef<HTMLButtonElement | null>(null);
   const rotateTrigger = useRef<HTMLButtonElement | null>(null);
-  const revokeTrigger = useRef<HTMLButtonElement | null>(null);
-  const revokeAll = useMutation({
-    mutationFn: () => result(api.revokeAllAdministratorSessions({ body: {} })),
-    onSuccess: session.forget,
-  });
   return (
     <>
       <DetailCardGrid className="security-settings-card-grid">
@@ -231,41 +223,8 @@ export function SecuritySettings({
           </CardContent>
         </Card>
         <PasswordForm key="password" />
-          <Card key="sessions">
-            <CardHeader>
-              <CardTitle role="heading" aria-level={2}>
-                登录会话
-              </CardTitle>
-              <CardDescription>注销所有设备上的管理员会话。</CardDescription>
-              <CardAction>
-                <DropdownMenu>
-                  <DropdownMenuTrigger
-                    render={
-                      <Button
-                        ref={revokeTrigger}
-                        variant="ghost"
-                        size="icon-sm"
-                        aria-label="会话操作"
-                      />
-                    }
-                  >
-                    <MoreHorizontal />
-                  </DropdownMenuTrigger>
-                  <DropdownMenuContent align="end">
-                    <DropdownMenuGroup>
-                      <DropdownMenuItem
-                        variant="destructive"
-                        onClick={() => requestDiscard(() => setRevoke(true))}
-                      >
-                        注销全部会话
-                      </DropdownMenuItem>
-                    </DropdownMenuGroup>
-                  </DropdownMenuContent>
-                </DropdownMenu>
-              </CardAction>
-            </CardHeader>
-          </Card>
       </DetailCardGrid>
+      <AdministratorSessions />
       {reveal && (
         <SecretDialog
           finalFocus={() => dialogOrigin.current}
@@ -282,43 +241,6 @@ export function SecuritySettings({
           onClose={() => setRotate(false)}
         />
       )}
-      <AlertDialog
-        open={revoke}
-        onOpenChange={(open, event) => {
-          if (!open && revokeAll.isPending) event.cancel();
-          else setRevoke(open);
-        }}
-      >
-        <AlertDialogContent
-          finalFocus={() => revokeTrigger.current}
-          className="max-h-[calc(100dvh-2rem)] w-[calc(100%-2rem)] overflow-y-auto"
-        >
-          <AlertDialogHeader>
-            <AlertDialogTitle>注销全部会话？</AlertDialogTitle>
-          </AlertDialogHeader>
-          <DialogBody><AlertDialogDescription>
-              包括当前设备，所有管理员都需要重新登录。
-            </AlertDialogDescription></DialogBody>
-          <ErrorNotice error={revokeAll.error} />
-          <AlertDialogFooter>
-            <AlertDialogCancel disabled={revokeAll.isPending}>
-              取消
-            </AlertDialogCancel>
-            <AlertDialogAction
-              variant="destructive"
-              disabled={revokeAll.isPending}
-              onClick={() => {
-                if (!revokeAll.isPending) revokeAll.mutate();
-              }}
-            >
-              {revokeAll.isPending && (
-                <Spinner aria-hidden="true" data-icon="inline-start" />
-              )}
-              注销全部会话
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
     </>
   );
 }
@@ -586,9 +508,9 @@ export function RotateKeyDialog({
         <DialogBody>
           <AlertDialogDescription>
             {webhook
-              ? "轮换后，新发送和重试的通知将使用新密钥签名，请同步更新业务系统的通知验签配置。已发出的请求可能仍使用旧密钥，接收端可短暂兼容新旧密钥。不会自动重发已完成的通知，也不会更改通知开关。"
+              ? "新通知和重试将使用新密钥，请同步业务系统验签配置。已发出的请求可能仍使用旧密钥，可短暂兼容新旧密钥。已完成通知不重发，通知开关不变。"
               : replacing ? "旧密钥立即失效。轮换后需更新业务服务端，否则无法创建订单。"
-              : `由 ${systemName} 生成并保管。生成后复制到业务系统后端的 ${systemName} 接入配置，无需填写业务系统自己的密钥。`}
+              : `生成后复制到业务系统后端的 ${systemName} 接入配置。`}
           </AlertDialogDescription>
           {error !== null && <><ErrorNotice error={error} /><p className="text-sm text-muted-foreground">结果未确认，请关闭后刷新配置并查看当前密钥。本次不再重试。</p></>}
         </DialogBody>
