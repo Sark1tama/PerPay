@@ -12,8 +12,20 @@ concurrency:
 
 jobs:
   validate:
-    runs-on: ubuntu-24.04
+    name: Validate ${{ matrix.architecture }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            architecture: amd64
+          - runner: ubuntu-24.04-arm
+            architecture: arm64
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
+    env:
+      IMAGE: perpay-validation:${{ github.sha }}-${{ matrix.architecture }}
+      ARCHITECTURE: ${{ matrix.architecture }}
     steps:
       - name: Check out source
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -21,14 +33,28 @@ jobs:
           persist-credentials: false
 
       - name: Build the application image
-        env:
-          IMAGE: perpay-validation:${{ github.sha }}
-        run: docker build --build-arg "APP_VERSION=$(node -p 'require("./package.json").version')" --tag "$IMAGE" .
+        run: |
+          set -euo pipefail
+          version="$(node -p 'require("./package.json").version')"
+          docker build --platform "linux/${ARCHITECTURE}" \
+            --build-arg "APP_VERSION=${version}" \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            --tag "$IMAGE" .
+          docker image inspect "$IMAGE" | jq -e \
+            --arg architecture "$ARCHITECTURE" \
+            --arg version "$version" \
+            --arg revision "$GITHUB_SHA" '
+              length == 1
+              and .[0].Os == "linux"
+              and .[0].Architecture == $architecture
+              and .[0].Config.Labels["org.opencontainers.image.version"] == $version
+              and .[0].Config.Labels["org.opencontainers.image.revision"] == $revision
+            ' >/dev/null
 
       - name: Scan the application image for high-risk vulnerabilities
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
-          image-ref: perpay-validation:${{ github.sha }}
+          image-ref: ${{ env.IMAGE }}
           version: v0.70.0
           cache: false
           scanners: vuln
@@ -39,8 +65,6 @@ jobs:
           timeout: 10m0s
 
       - name: Exercise Compose, backup, restore, and persistence
-        env:
-          IMAGE: perpay-validation:${{ github.sha }}
         run: |
           set -euo pipefail
           project="perpay-validation-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
@@ -98,11 +122,17 @@ jobs:
 
           export PERPAY_SMOKE_ISOLATED=1
           export PERPAY_SMOKE_PASSWORD="$(openssl rand -hex 32)"
+          PERPAY_SMOKE_SETUP_TOKEN="$(compose logs --no-color --no-log-prefix app |
+            jq -Rr 'fromjson? | select(.event == "administrator_setup_required") | .setup_token | select(type == "string")' | tail -n 1)"
+          test -n "$PERPAY_SMOKE_SETUP_TOKEN"
+          echo "::add-mask::$PERPAY_SMOKE_SETUP_TOKEN"
+          export PERPAY_SMOKE_SETUP_TOKEN
           admin_smoke() {
-            compose exec -T -e PERPAY_SMOKE_ISOLATED -e PERPAY_SMOKE_PASSWORD app \
+            compose exec -T -e PERPAY_SMOKE_ISOLATED -e PERPAY_SMOKE_PASSWORD -e PERPAY_SMOKE_SETUP_TOKEN app \
               node --input-type=module - "$1" < scripts/admin-smoke.mjs
           }
           admin_smoke initialize
+          unset PERPAY_SMOKE_SETUP_TOKEN
 
           instance_before="$(compose exec -T app node --input-type=module -e \
             "import {DatabaseSync} from 'node:sqlite';const db=new DatabaseSync('/data/perpay.sqlite3',{readOnly:true});try{console.log(db.prepare(\"SELECT value FROM system_metadata WHERE key = 'instance_id'\").get().value)}finally{db.close()}" | tr -d '\r')"

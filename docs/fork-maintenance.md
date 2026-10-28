@@ -1,6 +1,6 @@
 # 本 Fork 的技术与维护说明
 
-维护日期：2026-10-27。约束在 [AGENTS.md](../AGENTS.md)，通用发布方法在[定制部署指南](deployment.md)。这里描述与上游的差异和可复现工作方法，不包含任何部署方的私有运行信息。
+维护日期：2026-10-28。约束在 [AGENTS.md](../AGENTS.md)，通用发布方法在[定制部署指南](deployment.md)。这里描述与上游的差异和可复现工作方法，不包含任何部署方的私有运行信息。
 
 ## 代码与部署的四个版本
 
@@ -11,9 +11,9 @@
 | 发布包 | 私有发布目录内 manifest、源码快照和构建产物 SHA-256 |
 | 真正运行版本 | `docker inspect` 与 Compose 镜像引用、运行文件哈希 |
 
-自己的远程为 `https://github.com/Sark1tama/PerPay.git`，上游为 `https://github.com/Mashiro0619/PerPay.git`。当前维护在 `main`；2026-10-27 已推送 `ffaa237`，包含 `f28569e` 的上游合并及收银台修复。未因此创建新 Release 或重新部署。
+自己的远程为 `https://github.com/Sark1tama/PerPay.git`，上游为 `https://github.com/Mashiro0619/PerPay.git`。当前维护在 `main`；本次本地合并上游至 `b944672`，保留已有金额方向及收银台定制。此次合并不包含推送、Release 或生产部署；生产变更须另获明确同意。
 
-当前源码应用版本 `1.0.0-alpha.1`，数据库兼容声明24—37；以 `src/version.ts` 为准。上游相同版本号不保证相同 schema。根 `docker-compose.yml` 中的 GHCR `latest` 是通用上游模板，已有定制实例应以自己的私有部署配置为准。
+当前源码应用版本 `1.0.0-alpha.2.fork.1`，数据库兼容声明24—37；以 `src/version.ts` 为准。上游 `1.0.0-alpha.2` 的上限是36，定制版本后缀用于区分兼容范围，不代表已发布镜像。根 `docker-compose.yml` 中的 GHCR `latest` 是通用上游模板，已有定制实例应以自己的私有部署配置为准。
 
 ## 必须理解的定制
 
@@ -34,6 +34,7 @@
 - 本 Fork 已上线的迁移36实现双向金额调整；它的历史编号和校验和是生产数据库的一部分。
 - 上游新增的36是管理员会话登录 IP/UA，合入时在本 Fork 顺延为37，旧会话未知字段保持空值。
 - 因此“上游36”“本 Fork36”不能互换；同样声称支持37也不能跳过迁移内容比较。
+- 本次未新增或改写迁移。`test/migration-checksums.test.ts` 冻结本 Fork 的1—37迁移；`scripts/check-version.mjs` 保留上游历史版本的上限，单独记录 `1.0.0-alpha.2.fork.1` 对应37。
 - 合并上游应先 diff `migrations.ts`、配套迁移文件及 `version.ts`，在隔离副本迁移后验证完整性、外键和既有财务表/配置/密钥；详见[维护与恢复](maintenance.md#固定版本与回滚)。
 
 ## 开发与验证
@@ -59,7 +60,11 @@ npx.cmd playwright test ui-tests/checkout-touch.spec.ts --project core
 npx.cmd playwright test --config data/push-review.config.ts checkout-touch.spec.ts --project core
 ```
 
-该忽略文件不是仓库自带前提；新机器需自行准备测试环境或使用标准 Chromium。前端测试前重建产物，避免源码测试与 UI 夹具读取不同版本。2026-10-27 推送前通过类型检查、81项收银台逻辑测试、checkout双构建和Edge移动端测试；本轮并非重新执行所有上游测试或真实付款。
+该忽略文件不是仓库自带前提；新机器需自行准备测试环境或使用标准 Chromium。前端测试前重建产物，避免源码测试与 UI 夹具读取不同版本。2026-10-27 推送前通过类型检查、81项收银台逻辑测试、checkout双构建和Edge移动端测试；该次并未重新执行所有上游测试或真实付款。
+
+2026-10-28 合并验证：Node.js 24.22.1 下 `npm run check` 通过，包含版本/API校验、类型检查、1275项后端测试、1897项前端测试及管理端、checkout客户端/SSR、服务端构建；Edge浏览器34项通过，覆盖收银台布局、复制金额、状态、200%文字缩放、无脚本展示、弹窗键盘滚动、网站必填项及详情来源。仅使用合成数据，未运行生产验收或本机Docker双架构验收。
+
+本次macOS验证将 `TMPDIR` 指向真实路径，避免 `/var` 与 `/private/var` 的符号链接差异；临时Node预加载脚本仅将测试客户端 `http.globalAgent.maxSockets` 限为32，避免160条并发连接超过本机监听队列，原测试请求总数及限流断言保持不变。前端菜单弹窗测试等待焦点进入后才发送Escape，避免把异步聚焦尚未完成当作关闭失败。
 
 ## 合并与交付
 

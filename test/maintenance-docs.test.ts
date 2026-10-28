@@ -88,10 +88,11 @@ describe("maintenance documentation version contract", () => {
     assert.ok(current.includes(APP_VERSION));
     assert.ok(current.includes(`(v${APP_VERSION}.md)`));
     assert.ok(maintenance.includes("当前源码版本为 `" + APP_VERSION + "`"));
-    assert.ok(notes.includes(`ghcr.io/mashiro0619/perpay:${APP_VERSION}`));
+    assert.ok(notes.includes("定制镜像"));
+    assert.ok(notes.includes("未发布"));
     // Compatibility details live in the maintenance guide linked by release notes.
     // The migration catalog and supported range are checked below.
-    assert.ok(notes.includes(`https://github.com/Mashiro0619/PerPay/blob/v${APP_VERSION}/docs/maintenance.md#固定版本与回滚`));
+    assert.ok(notes.includes("https://github.com/Sark1tama/PerPay/blob/main/docs/maintenance.md#固定版本与回滚"));
     assert.doesNotMatch(notes, /\]\(\.\.?\//, "GitHub Release notes must not contain relative document links");
     assert.ok(notes.includes("PERPAY_MASTER_KEY"));
     assert.ok(maintenance.includes("docker compose stop app backup"));

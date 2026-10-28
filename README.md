@@ -18,7 +18,8 @@
   <a href="#界面预览">界面预览</a> ·
   <a href="#部署">快速部署</a> ·
   <a href="docs/alipay-setup.md">支付宝配置</a> ·
-  <a href="USAGE.md">接入文档</a>
+  <a href="USAGE.md">接入文档</a> ·
+  <a href="CHANGELOG.md">变更日志</a>
 </p>
 
 ## 本 Fork 的维护入口
@@ -95,9 +96,14 @@ docker compose ps
 
 ## 初始化
 
-1. 访问 `https://你的域名/admin`；本机试用访问 [http://localhost:6190/admin](http://localhost:6190/admin)。
-2. 创建管理员并登录，密码至少 6 个字符，建议使用更长的随机密码。
-3. 按 [支付宝配置图文教程](docs/alipay-setup.md) 完成向导，检查收款就绪。
+默认镜像 `latest` 跟随稳定版，初始化方式可能与当前源码或预发布版本不同。以已安装版本的管理页面为准，首次创建管理员前继续限制访问。
+
+1. 访问 `https://你的域名/admin/`；本机试用访问 [http://localhost:6190/admin/](http://localhost:6190/admin/)。已初始化的实例直接登录。
+2. 如果页面要求**初始化令牌**，在部署目录运行 `docker compose logs --tail=100 app`，读取最近一次启动时 `administrator_setup_required` 事件中的 `setup_token`；源码部署从服务启动终端读取。未包含令牌功能的旧版页面只要求设置密码，也不会输出该事件，直接按页面设置即可。
+3. 按页面要求设置管理员密码，至少 6 个字符，建议使用更长的随机密码。创建成功后用该密码登录。带令牌的版本会立即使令牌失效；未完成初始化时重启服务会生成新令牌，请重新读取启动日志。
+4. 按 [支付宝配置图文教程](docs/alipay-setup.md) 完成向导，检查收款就绪。
+
+初始化令牌只用于首次创建管理员，不是登录密码。不要公开包含令牌的启动日志；公网部署通过后台所在的 HTTPS 地址提交初始化，不把令牌放进网址。
 
 订单结束后的应付金额默认冷却 10 分钟再复用；这不是补付宽限期，也不能完全消除静态码的归属风险。付款截止与重试规则见 [接入说明](USAGE.md#金额复用冷却与付款截止)。
 
@@ -137,6 +143,7 @@ docker compose up -d
 | [文案术语表](docs/glossary.md) | 收款、查账、通知及字段来源的统一用词 |
 | [调用端 Demo](examples/node-client/README.md) | 业务网站接入示例 |
 | [维护说明](docs/maintenance.md) | 备份恢复、版本升级、回滚与密码重设 |
+| [数据与隐私](docs/privacy.md) | 付款人相关字段、原始证据、会话信息与实际保留规则 |
 | [前端开发](web/README.md) · [OpenAPI](openapi.yaml) | 构建、测试与接口定义 |
 
 ## 许可证

@@ -4,6 +4,10 @@
 
 本文面向需要把网站接入 PerPay 的开发者。多站配置边界、生命周期和接口索引见[多业务网站指南](docs/multi-site.md)。所有 API 密钥和通知签名密钥（下文简称通知密钥）只能保存在网站后端，不能放进浏览器 JavaScript、移动端安装包或公开仓库。
 
+首次接入可先阅读[快速接入指南](docs/integration-quickstart.md)，按签名、下单、跳转、收通知、验签和履约的顺序完成接入。
+
+排查调用问题时参阅[签名测试向量](docs/signature-vectors.md)和[业务错误码与重试建议](docs/integration-errors.md)。
+
 ## 收款方式与适用范围
 
 PerPay 不用在手机上运行监听软件，服务器需持续运行。收款需要支付宝经营码和具备账务明细查询权限的开放平台应用，具体开通条件以支付宝为准。
@@ -41,7 +45,7 @@ PerPay 不用在手机上运行监听软件，服务器需持续运行。收款�
 
 也可直接调用以下管理 API：
 
-1. 通过 `POST /api/admin/v1/setup` 设置管理员密码，再通过 `POST /api/admin/v1/session/login` 创建管理员会话。
+1. 从当前服务启动日志的 `administrator_setup_required` 事件读取 `setup_token`（Docker 部署执行 `docker compose logs --tail=100 app`），通过 `POST /api/admin/v1/setup` 在 JSON 正文中同时提交 `setup_token` 和 `password`。令牌只在本次未初始化的进程中有效，管理员创建成功后失效，重启未初始化服务会换新令牌。初始化不会创建会话，再通过 `POST /api/admin/v1/session/login` 提交密码登录；不要把令牌写进 URL 或保存到业务网站配置。
 2. 使用 `POST /api/admin/v1/settings/provider/application-key/actions/generate` 首次生成支付宝应用密钥对（公钥和私钥），再配置支付宝接入与经营码；此首次生成接口保持幂等，不直接替换已有密钥对。需要更换时，使用下述应用公钥变更流程。`POST /api/admin/v1/sites/:clientId/secrets/api_secret/actions/rotate` 生成或轮换的是对应业务网站的 PerPay API 密钥，两者不能混用。
 3. 使用 `POST /api/admin/v1/sites` 创建网站，提交 UUID `operation_id` 和完整 `configuration`，初始 `notifications_enabled` 为 `false`。可先通过 `GET /api/admin/v1/settings/site-defaults` 取得策略模板；客户端 ID 由服务端生成，不能自行指定。
 4. 在该网站下调用 `POST /api/admin/v1/sites/:clientId/secrets/api_secret/actions/rotate` 生成 API 密钥；需要通知时，再调用 `POST /api/admin/v1/sites/:clientId/secrets/webhook_secret/actions/rotate` 生成通知密钥。每次携带最新的网站 `revision`，后一次操作使用前一次响应中的版本。密钥只保存到对应网站后端的环境变量或密钥管理器；已有通知密钥可通过 `POST /api/admin/v1/sites/:clientId/secrets/webhook_secret/actions/view` 显式查看，无需轮换。
@@ -354,7 +358,9 @@ export async function receivePerPayWebhook(request) {
 }
 ```
 
-网络错误、`5xx`、`429` 或错误 ACK 会触发重试；`401`、`403` 等鉴权错误可能直接进入失败或死信。新事件为 `PAYMENT_CONFIRMED` 和 `PAYMENT_DISPUTED`；旧版已生成的 `REFUND_UPDATED` 仍保留原语义并按原流程投递、重试，客户端需要继续兼容。管理员标记／撤销退款不会生成事件或重新发送通知。客户端应根据 `schema` 分派并容忍未来增加的字段。
+网络和 TLS 证书错误、`201`–`204`、所有 `3xx`、`401`、`403`、`404`、`408`、`409`、`419`、`422`、`425`、`429`、`5xx`，以及 HTTP `200` 下的错误 ACK（不含不支持的压缩编码）都会按配置的退避策略重试。重试仍严格校验证书，不跟随重定向；只有符合上文要求的 HTTP `200` ACK 才算成功。`410` 表示接收端明确拒收，不再重试；来源策略违规（如 `target_address_forbidden`、`webhook_target_not_allowed`）仍是永久失败。达到尝试次数上限后进入死信，不能将自动重试理解为保证送达。
+
+新事件为 `PAYMENT_CONFIRMED` 和 `PAYMENT_DISPUTED`；旧版已生成的 `REFUND_UPDATED` 仍保留原语义并按原流程投递、重试，客户端需要继续兼容。管理员标记／撤销退款不会生成事件或重新发送通知。客户端应根据 `schema` 分派并容忍未来增加的字段。
 
 ## 6. 后台操作与外观
 

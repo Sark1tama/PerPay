@@ -7,16 +7,20 @@ export function listAdminAssets(directory = resolve("web-dist/admin/assets")) {
   return readdirSync(directory).filter((name) => /\.(?:js|css)$/.test(name)).map((name) => `/admin/assets/${name}`);
 }
 
-export async function runAdminSmoke({ baseUrl, password, initialize = false, isolated = false, assets = [], request = fetch }) {
+export async function runAdminSmoke({ baseUrl, password, setupToken, initialize = false, isolated = false, assets = [], request = fetch }) {
   const origin = new URL(baseUrl);
   assert.equal(isolated, true, "admin smoke requires an explicitly isolated instance");
   assert.ok(origin.protocol === "http:" && ["127.0.0.1", "localhost", "[::1]"].includes(origin.hostname), "admin smoke only accepts loopback HTTP");
   assert.ok(typeof password === "string" && password.length >= 24, "provide a random temporary administrator password");
+  assert.ok(!initialize || (typeof setupToken === "string" && setupToken.length > 0), "provide the current setup token from the isolated instance startup log");
   const send = (path, options = {}) => request(new URL(path, origin).href, { redirect: "error", signal: AbortSignal.timeout(15000), ...options });
   const jsonHeaders = { "content-type": "application/json", origin: origin.origin };
   const checkedAssets = new Set(["/admin/theme.js", ...assets]);
+  const canonical = await send("/admin", { redirect: "manual" });
+  assert.equal(canonical.status, 308, "/admin must redirect to its canonical entry");
+  assert.equal(canonical.headers.get("location"), "/admin/");
   let entryHtml = "";
-  for (const path of ["/admin", "/admin/orders", "/admin/settings/security", "/admin/reconciliation", "/admin/notifications"]) {
+  for (const path of ["/admin/", "/admin/orders", "/admin/settings/security", "/admin/reconciliation", "/admin/notifications"]) {
     const response = await send(path);
     assert.equal(response.status, 200, `${path} must load`);
     assert.match(response.headers.get("content-type") ?? "", /text\/html/);
@@ -30,7 +34,7 @@ export async function runAdminSmoke({ baseUrl, password, initialize = false, iso
     assert.match(html, /src="\/admin\/theme\.js"/);
     assert.match(html, /<link\b[^>]*rel="icon"[^>]*href="\/admin\/assets\/favicon-[A-Za-z0-9_-]+\.svg"/, "entry must reference its fingerprinted favicon");
     for (const match of html.matchAll(/(?:src|href)="(\/admin\/[^"?#]+\.(?:js|css|svg))"/g)) checkedAssets.add(match[1]);
-    if (path === "/admin") entryHtml = html;
+    if (path === "/admin/") entryHtml = html;
   }
   for (const path of checkedAssets) {
     const response = await send(path);
@@ -46,10 +50,10 @@ export async function runAdminSmoke({ baseUrl, password, initialize = false, iso
   assert.equal((await send("/api/admin/v1/orders")).status, 401);
   if (initialize) {
     assert.match(entryHtml, /name="perpay-initialized" content="false"/, "refusing to initialize an existing administrator");
-    const setup = await send("/api/admin/v1/setup", { method: "POST", headers: jsonHeaders, body: JSON.stringify({ password }) });
+    const setup = await send("/api/admin/v1/setup", { method: "POST", headers: jsonHeaders, body: JSON.stringify({ password, setup_token: setupToken }) });
     assert.equal(setup.status, 204);
     assert.equal(setup.headers.getSetCookie().length, 0);
-    const repeated = await send("/api/admin/v1/setup", { method: "POST", headers: jsonHeaders, body: JSON.stringify({ password }) });
+    const repeated = await send("/api/admin/v1/setup", { method: "POST", headers: jsonHeaders, body: JSON.stringify({ password, setup_token: setupToken }) });
     assert.equal(repeated.status, 409);
   } else {
     assert.match(entryHtml, /name="perpay-initialized" content="true"/);
@@ -113,6 +117,7 @@ if (process.argv[1] === "-" || (process.argv[1] && import.meta.url === pathToFil
   const result = await runAdminSmoke({
     baseUrl: process.env.PERPAY_PUBLIC_URL ?? "http://localhost:6190",
     password: process.env.PERPAY_SMOKE_PASSWORD,
+    setupToken: process.env.PERPAY_SMOKE_SETUP_TOKEN,
     isolated: process.env.PERPAY_SMOKE_ISOLATED === "1",
     initialize: mode === "initialize",
     assets: listAdminAssets(),

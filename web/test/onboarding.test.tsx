@@ -57,6 +57,7 @@ describe("first collection onboarding", () => {
     document.head.append(meta);
     const view = mountOnboarding({ signedIn: false, path: "/setup" });
     await screen.findByLabelText("设置管理员密码");
+    edit("一次性初始化令牌", "e".repeat(64));
     edit("设置管理员密码", "isolated-onboarding-password");
     edit("再次输入密码", "isolated-onboarding-password");
     const user = userEvent.setup();
@@ -197,7 +198,7 @@ describe("first collection onboarding", () => {
     expect(
       view.router.state.location.state?.deferOnboardingFor,
     ).toBeUndefined();
-    await user.click(screen.getByRole("button", { name: "账户菜单" }));
+    await user.click(screen.getByRole("button", { name: /账户菜单$/ }));
     await user.click(await screen.findByRole("menuitem", { name: "退出登录" }));
     await screen.findByRole("heading", { name: "登录管理后台" });
     expect(isOnboardingDeferred(instanceId)).toBe(false);

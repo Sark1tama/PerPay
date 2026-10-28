@@ -20,6 +20,24 @@ docker compose --profile maintenance run --rm maintenance health
 
 公开探针的深度数据库结构校验及就绪状态聚合结果最多缓存 1 秒，维护锁、租约、时钟和存储空间等运行条件仍逐次检查。该缓存不用于下单、管理操作或维护工具的严格数据库检查；探针正常不替代实际请求的收款准入校验。
 
+## 外部监控
+
+在独立于 PerPay 宿主的监控服务中配置告警，避免宿主失联时监控也一起停止。以 Uptime Kuma 为例，新建 **HTTP(s) - Keyword** 监控，URL 填实际公网 HTTPS 地址的 `/readyz`，关键字完整填写 `"status":"ready"`（包含双引号）。设置请求超时、检查间隔及通知渠道；响应不是成功状态、超时或缺少该关键字时均告警。
+
+`degraded` 可能仍返回 HTTP 200，例如最近一次查账成功尚未过期，但后续任务已经失败。因此不能只检查 HTTP 状态码，也不能只匹配 `ready` 子串；`degraded` 和 `not_ready` 都应触发告警。首次配置、升级及计划维护期间，可在监控服务中设置有截止时间的静默。
+
+`/readyz` 不包含自动备份的健康状态。还需在宿主上定期检查 `backup` 容器，并将非零退出码作为告警；外部监控同时检查这项定时任务是否按时上报。以下命令在部署目录执行，只有容器正在运行且 Docker 健康状态为 `healthy` 才成功：
+
+```sh
+backup_container="$(docker compose ps --all --quiet backup)" &&
+test -n "$backup_container" &&
+test "$(docker inspect --format '{{.State.Running}} {{if .State.Health}}{{.State.Health.Status}}{{else}}missing{{end}}' "$backup_container")" = 'true healthy'
+```
+
+容器不存在、已停止、缺少健康检查、处于 `starting` 或 `unhealthy` 时均不能视为备份正常。当前 Compose 每 5 分钟检查一次，超时为 10 秒，启动宽限为 10 分钟，连续失败 3 次标记为 `unhealthy`；监控侧应结合启动宽限设置告警延迟。
+
+排查时可执行 `docker compose exec -T backup node dist/backup/runner.js health` 查看备份健康详情；返回 `ok: false` 时退出码为 1。保持 `backup` 的网络隔离，在宿主运行容器状态检查，不向应用或备份容器挂载 Docker Socket。
+
 <a id="采集持续失败"></a>
 
 ## 查账持续失败
@@ -83,7 +101,7 @@ docker compose up -d
 
 回滚前先备份并查看版本说明。旧版本不一定兼容新版数据库；需要恢复时，使用目标版本兼容的备份。
 
-当前源码版本为 `1.0.0-alpha.1`，最新数据库 schema 为 37，运行兼容范围为 24—37，应用启动时会自动迁移旧结构。已发布 `0.3.1` 镜像最多支持 schema 31，不能打开 schema 33 数据库。正式 `0.3.0` 只支持到 schema 29，不能直接打开升级到 schema 31 的数据；已发布的 `0.3.0-alpha.1` 只支持到 schema 26，不能打开升级到 27—31 的数据。升级前请核对目标版本的发布说明和数据库兼容范围，不要只比较应用版本名称。
+当前源码版本为 `1.0.0-alpha.2.fork.1`，最新数据库 schema 为 37，运行兼容范围为 24—37，应用启动时会自动迁移旧结构。已发布 `0.3.1` 镜像最多支持 schema 31，不能打开 schema 33 数据库。正式 `0.3.0` 只支持到 schema 29，不能直接打开升级到 schema 31 的数据；已发布的 `0.3.0-alpha.1` 只支持到 schema 26，不能打开升级到 27—31 的数据。升级前请核对目标版本的发布说明和数据库兼容范围，不要只比较应用版本名称。
 
 本次预发布的多网站、设置拆分及破坏性变更见[1.0.0-alpha.1 版本说明](releases/v1.0.0-alpha.1.md)；[1.0.0 开发规划](releases/v1.0.0.md)保留供对照。已发布的 0.3.2 最多支持 schema 33，不能打开新库。源码版本号与说明文件存在不代表已创建发布标签或镜像，发布状态请以实际 Release 和镜像为准。
 
@@ -159,11 +177,110 @@ node dist/backup/runner.js health
 
 不要同时运行两份定时备份，也不要把不同实例指向同一目录。
 
+命令及定时备份失败时，JSON 日志保留 `stage`，并通过 `message` 给出可公开的原因；文件系统错误另有已知的 `error_code`。例如可区分权限不足、空间不足、摘要不匹配、主密钥不匹配和活动租约。日志不会输出任意原始异常、文件路径、密钥或上游正文；未知异常仅给出通用说明，需在服务器本地按失败阶段核查。
+
 成功备份不等于已完成恢复演练；恢复仍按下节在停服、保留当前数据后执行。
+
+## 主密钥与备份的异地保存
+
+数据库备份不包含部署主密钥。默认 Compose 将它们分别放在 `perpay-backups` 卷和 `perpay-secrets` 卷；后者的文件路径是 `/run/perpay-secrets/master-key`。只有数据库备份、没有原主密钥，不能恢复其中加密保存的配置。请将两者分别加密后保存到另一台机器或离线介质，不能只留在 PerPay 宿主上。
+
+下面以 age 公钥加密为例。宿主安装 age，只需要接收方公钥；age 解密私钥应保存在可信工作站或离线介质，不复制到 PerPay 宿主，不与密文一起上传。首次准备接收方密钥时，在可信工作站执行一次：
+
+```bash
+umask 077
+age-keygen -o perpay-recovery.agekey
+age-keygen -y perpay-recovery.agekey
+```
+
+妥善保存 `perpay-recovery.agekey`，将最后输出的 `age1…` 公钥带到宿主。它与 PerPay 的 `master-key` 是两种不同的密钥：前者用于解密异地导出包，后者用于解开 PerPay 数据库内的加密配置。
+
+以下命令在宿主 Bash、`docker-compose.yml` 所在目录执行。确认没有另行运行的备份、恢复或清理进程；脚本会暂停自动备份，先生成一次新备份，再导出完整备份目录及主密钥。应用可以继续运行。若自动备份原本正在运行，退出脚本时会将其重新启动。
+
+```bash
+(
+  set -euo pipefail
+  umask 077
+  read -r -p 'age 接收方公钥（age1...）：' recipient
+  test -n "$recipient"
+  mkdir -p "$HOME/perpay-offsite"
+  export_directory="$(mktemp -d "$HOME/perpay-offsite/export.XXXXXXXX")"
+  backup_was_running="$(docker compose ps --status running --quiet backup)"
+  resume_backup() {
+    if [ -n "$backup_was_running" ]; then
+      docker compose start backup >&2
+    fi
+  }
+  trap resume_backup EXIT
+  docker compose stop backup
+
+  docker compose --profile maintenance run --rm --no-deps -T maintenance run-once
+
+  docker compose run --rm --no-deps -T --entrypoint tar backup \
+    -C /backups -cf - . |
+    age -r "$recipient" -o "$export_directory/perpay-backups.tar.age.part"
+  mv "$export_directory/perpay-backups.tar.age.part" "$export_directory/perpay-backups.tar.age"
+
+  docker compose --profile maintenance run --rm --no-deps -T --entrypoint tar maintenance \
+    -C /run/perpay-secrets -cf - master-key |
+    age -r "$recipient" -o "$export_directory/perpay-master-key.tar.age.part"
+  mv "$export_directory/perpay-master-key.tar.age.part" "$export_directory/perpay-master-key.tar.age"
+
+  (
+    cd "$export_directory"
+    sha256sum perpay-backups.tar.age perpay-master-key.tar.age > SHA256SUMS
+  )
+  printf '加密导出目录：%s\n' "$export_directory"
+)
+```
+
+`tar` 的输出直接通过管道交给宿主上的 age，未加密的归档不落盘；`-T` 禁用终端转换，`--entrypoint tar` 不启动应用或维护脚本，`--no-deps` 不启动依赖服务。`pipefail` 会让读取失败或加密失败中止脚本；仅完整成功的文件才去掉 `.part` 后缀。失败后先检查 `docker compose ps backup`，确认自动备份已经恢复；不要把 `.part` 文件当作可恢复备份。
+
+将两份 `.age` 密文及 `SHA256SUMS` 复制到已配置的独立备份主机或离线介质。例如，替换以下目录、账号及地址后，在宿主执行：
+
+```bash
+cd "$HOME/perpay-offsite/export.替换为实际目录"
+scp perpay-backups.tar.age perpay-master-key.tar.age SHA256SUMS \
+  backup-user@backup-host:/srv/private/perpay/
+```
+
+只传上述密文和校验文件，不传 `perpay-recovery.agekey`、明文 `master-key`、未加密数据库或完整环境变量文件。保留多代异地副本；重新生成主密钥不能替代已经丢失的原主密钥。
+
+如果部署显式设置了 `PERPAY_MASTER_KEY`，代码会优先使用该环境变量，卷内 `master-key` 可能不是当前使用的值。此时应从实际部署的受控凭据来源另外加密保存这 64 位十六进制值，而不能只导出密钥卷。对于正在运行且通过 Compose 注入该变量的 `app`，可用下面的流式命令替代上面的主密钥 tar 导出；它不会把值放到终端或命令参数中：
+
+```bash
+set -euo pipefail
+umask 077
+read -r -p 'age 接收方公钥（age1...）：' recipient
+mkdir -p "$HOME/perpay-offsite"
+output_directory="$(mktemp -d "$HOME/perpay-offsite/env-key.XXXXXXXX")"
+docker compose exec -T app node -e '
+  const value = process.env.PERPAY_MASTER_KEY;
+  if (!/^[0-9a-fA-F]{64}$/.test(value ?? "")) {
+    console.error("app 未配置有效的 PERPAY_MASTER_KEY，请检查实际部署的凭据来源");
+    process.exit(1);
+  }
+  process.stdout.write(value + "\n");
+' | age -r "$recipient" -o "$output_directory/perpay-master-key.txt.age.part"
+mv "$output_directory/perpay-master-key.txt.age.part" "$output_directory/perpay-master-key.txt.age"
+```
+
+环境变量方案的密文解开后是主密钥文本，不是 tar；将这份密文与对应数据库备份一起保存。源码部署同样保存实际生效的 `PERPAY_MASTER_KEY`，或 `PERPAY_SECRETS_DIR/master-key`，不要运行会打印整个环境的诊断命令。使用密码管理器或部署平台保管变量时，另行保留其受控恢复方式。
+
+首次导出及定期检查时，在持有 age 私钥的可信工作站下载密文，验证传输摘要，再解密并只列出归档目录：
+
+```bash
+set -euo pipefail
+sha256sum -c SHA256SUMS
+age --decrypt -i /安全路径/perpay-recovery.agekey perpay-backups.tar.age | tar -tf -
+age --decrypt -i /安全路径/perpay-recovery.agekey perpay-master-key.tar.age | tar -tf -
+```
+
+备份包应包含已经发布的备份及其清单，主密钥包应包含 `master-key`。这能检查密文可解密、归档可读；还需按恢复章节在隔离环境做恢复演练，确认备份与主密钥配对。恢复时使用明确的备份名称、SHA-256 和原主密钥，不在生产数据目录直接展开归档。
 
 ## 恢复数据库
 
-恢复会覆盖当前数据库。先保留当前数据副本，并确认原 `perpay-secrets` 卷仍在。
+恢复会覆盖当前数据库。先保留当前数据副本，并确认原 `perpay-secrets` 卷仍在。停止应用、自动备份及所有其他会打开该数据库的进程；`docker compose stop app backup` 不会停止另行启动的维护容器。
 
 1. 停止应用和自动备份，列出可用备份：
 
@@ -183,6 +300,22 @@ node dist/backup/runner.js health
    ```sh
    docker compose up -d
    ```
+
+### 主库损坏时隔离原始文件
+
+主库被确认损坏（SQLite `CORRUPT`、`NOTADB` 或完整性检查失败），或已变成零字节时，可以显式请求隔离后恢复：
+
+```sh
+docker compose --profile maintenance run --rm maintenance restore BACKUP_NAME SHA256 --confirm-replace-current-database --quarantine-unreadable-current
+```
+
+使用 `--quarantine-unreadable-current` 表示已经停止所有可能访问数据库的进程。损坏的库可能无法读取租约，工具无法据此证明进程已停止；可读取的活动应用租约仍会阻止恢复。权限、I/O 或数据库繁忙等错误不会被当成损坏来绕过。
+
+工具先校验所选备份的摘要、schema 和原主密钥，在维护锁内复制当前主库及 `-wal`、`-shm`、`-journal` 到临时副本检查，避免 SQLite 探测改写原始文件。已校验的恢复文件落盘后，才将原文件逐个移入数据目录下独立的 `perpay-unreadable-before-restore-…` 私有目录。请预留复制当前数据库及恢复文件所需的磁盘空间。
+
+成功结果的 `quarantinedDatabaseName` 是隔离目录名，请完整保留这个目录。已有的旧主库单文件清理不会删除它。若隔离或发布中断，原始文件可能分布在数据目录与隔离目录中，维护锁会继续阻止应用启动；保留两处文件与锁，先核对失败阶段和文件，再处理恢复，不能直接删锁或重启。
+
+所有恢复命令均不读取当前库的备份策略，暂用启动配置中的间隔和保留份数，并输出警告，以免首次不带隔离参数的尝试就改动原文件。若备份状态文件也损坏或缺失，核对选中备份后另外添加 `--rebuild-state`；它与主库隔离是独立确认，可同时使用。恢复成功后检查后台备份设置和新的备份结果；定时备份仍读取恢复后数据库中的实际策略。
 
 ## 清理遗留维护锁
 
