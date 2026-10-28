@@ -1,6 +1,6 @@
 import type { Locator } from "@playwright/test";
 import { test, expect, login, record } from "./fixtures";
-import { expectTouchTarget, tapOutsideVisible } from "./touch-targets";
+import { expectTouchTarget, tapOutsideVisible, waitForControlAnimations } from "./touch-targets";
 
 async function readableText(target: Locator) {
   const geometry = await target.evaluate(element => {
@@ -120,7 +120,7 @@ test.describe("compact mobile controls preserve their actual touch areas", () =>
         sidebar.getByRole("navigation", { name: "网站选择", exact: true }).getByRole("link", { name: "全部网站", exact: true }),
         sidebar.getByRole("navigation", { name: "全局管理", exact: true }).getByRole("link", { name: "运行状态", exact: true }),
         sidebar.getByRole("navigation", { name: "设置导航", exact: true }).getByRole("link", { name: "设置", exact: true }),
-        sidebar.getByRole("button", { name: "账户菜单", exact: true }),
+        sidebar.getByRole("button", { name: /账户菜单$/, exact: true }),
       ];
       const geometry = [];
       for (const target of targets) {
@@ -168,6 +168,7 @@ test.describe("desktop control density", () => {
     expect(appearanceHeight).toBeCloseTo(32, 1);
     await appearance.click();
     const light = page.getByRole("menuitemradio", { name: "浅色", exact: true });
+    await waitForControlAnimations(light);
     const menuHeight = (await light.boundingBox())!.height;
     expect(menuHeight).toBeCloseTo(28, 1);
     await light.click();

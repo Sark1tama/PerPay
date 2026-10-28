@@ -20,6 +20,8 @@ function mount(path = "/sites/site_test/settings/basic", failSave = false, field
   let saved = structuredClone(initial), defaults = structuredClone(policy);
   let failRead = false;
   let delayedRead: ((snapshot: Site) => Promise<Response>) | null = null;
+  let delayedDelete: (() => Promise<Response>) | null = null;
+  let delayedNavigation: (() => Promise<null>) | null = null;
   const writes: Array<{ path: string; method: string; body: Record<string, unknown> }> = [];
   const fetchMock = vi.fn(async (request: Request) => {
     const path = new URL(request.url).pathname;
@@ -33,7 +35,7 @@ function mount(path = "/sites/site_test/settings/basic", failSave = false, field
       if (path.endsWith("/actions/rotate")) { saved = { ...saved, revision: saved.revision + 1 }; return json({ data: { site: saved, secret: "synthetic-site-key" } }); }
       if (path.endsWith("/actions/view")) return json({ data: { secret: "synthetic-site-key" } });
       if (path.endsWith("/site-defaults")) { defaults = body.policy as SitePolicy; return json({ data: { revision: 1, policy: defaults } }); }
-      if (request.method === "DELETE") return new Response(null, { status: 204 });
+      if (request.method === "DELETE") return delayedDelete ? delayedDelete() : new Response(null, { status: 204 });
       saved = { ...saved, configuration: body.configuration as Site["configuration"], revision: saved.revision + 1 };
       return json({ data: saved }, path === "/api/admin/v1/sites" ? 201 : 200);
     }
@@ -69,6 +71,7 @@ function mount(path = "/sites/site_test/settings/basic", failSave = false, field
   vi.stubGlobal("fetch", fetchMock);
   const router = createMemoryRouter([{ element: <DraftProvider><Outlet /></DraftProvider>, children: [
     { path: "/sites", element: <Sites /> }, { path: "/sites/new", element: <SiteEditorPage /> }, { path: "/sites/defaults", element: <SiteDefaultsPage /> }, { path: "/sites/:clientId/settings/:section", element: <SiteEditorPage /> },
+    { path: "/orders", element: <h1>订单目标页</h1>, loader: () => delayedNavigation?.() ?? null },
   ] }], { initialEntries: [path] });
   render(<QueryClientProvider client={queryClient}><Toaster><RouterProvider router={router} /></Toaster></QueryClientProvider>);
   return {
@@ -79,6 +82,22 @@ function mount(path = "/sites/site_test/settings/basic", failSave = false, field
       saved = { ...saved, revision: saved.revision + 1, configuration };
     },
     failReads(value: boolean) { failRead = value; },
+    delayNextDelete() {
+      let release!: () => void;
+      delayedDelete = () => new Promise(resolve => {
+        delayedDelete = null;
+        release = () => resolve(new Response(null, { status: 204 }));
+      });
+      return { release: () => release() };
+    },
+    delayNextNavigation() {
+      let release!: () => void;
+      delayedNavigation = () => new Promise(resolve => {
+        delayedNavigation = null;
+        release = () => resolve(null);
+      });
+      return { release: () => release() };
+    },
     delayNextRead() {
       let release!: () => void;
       let started = false;
@@ -93,6 +112,78 @@ function mount(path = "/sites/site_test/settings/basic", failSave = false, field
 afterEach(() => onlineManager.setOnline(true));
 
 describe("business website management", () => {
+  it("rejects a whitespace-only name before sending a website update", async () => {
+    const view = mount(), user = userEvent.setup();
+    const input = await screen.findByLabelText("业务网站名称");
+    fireEvent.change(input, { target: { value: "   " } });
+    await user.click(screen.getByRole("button", { name: "保存业务网站" }));
+    expect(view.writes).toHaveLength(0);
+    expect(input).toHaveAccessibleDescription("请输入业务网站名称。");
+  });
+
+  it.each([
+    { path: "/sites/new", label: "业务网站名称", button: "创建业务网站" },
+    { path: "/sites/site_test/settings/basic", label: "业务网站名称", button: "保存业务网站" },
+    { path: "/sites/site_test/settings/display", label: "收银台名称", button: "保存业务网站" },
+    { path: "/sites/defaults", label: "收银台名称", button: "保存默认模板", tab: "收银台展示" },
+  ])("uses custom required feedback for empty and whitespace-only $label at $path", async ({ path, label, button, tab }) => {
+    const view = mount(path), user = userEvent.setup();
+    if (tab) await user.click(await screen.findByRole("tab", { name: tab }));
+    const input = await screen.findByLabelText(label);
+    const invalidEvents: Event[] = [];
+    input.addEventListener("invalid", event => invalidEvents.push(event));
+    for (const value of ["", "   ", "\u3000"]) {
+      fireEvent.change(input, { target: { value } });
+      await user.click(screen.getByRole("button", { name: button }));
+      expect(await screen.findByText(`请输入${label}。`)).toBeVisible();
+      expect(input).toHaveAttribute("aria-invalid", "true");
+      expect(input).toHaveAccessibleDescription(`请输入${label}。`);
+      expect(input.closest('[data-slot="field"]')).toHaveAttribute("data-invalid", "true");
+      expect(input).toHaveFocus();
+      expect(invalidEvents.length).toBeGreaterThan(0);
+      expect(invalidEvents[invalidEvents.length - 1]!.defaultPrevented).toBe(true);
+      expect(view.writes).toHaveLength(0);
+      fireEvent.change(input, { target: { value: "有效名称" } });
+      expect(input).not.toHaveAttribute("aria-invalid", "true");
+      expect(input).not.toHaveAttribute("aria-describedby");
+      expect(input).toBeValid();
+      expect(screen.queryByText(`请输入${label}。`)).not.toBeInTheDocument();
+    }
+  });
+
+  it.each(["/sites/site_test/settings/orders", "/sites/defaults"])("focuses the first missing policy number and exposes both custom errors at %s", async path => {
+    const view = mount(path), user = userEvent.setup();
+    const first = await screen.findByLabelText("收银台有效期（秒）");
+    const second = screen.getByLabelText("最大调整金额（分）");
+    fireEvent.change(first, { target: { value: "" } });
+    fireEvent.change(second, { target: { value: "" } });
+    await user.click(screen.getByRole("button", { name: path.endsWith("defaults") ? "保存默认模板" : "保存业务网站" }));
+    expect(await screen.findByText("请输入收银台有效期（秒）。")).toBeVisible();
+    expect(second).toHaveAccessibleDescription("请输入最大调整金额（分）。");
+    expect(first).toHaveFocus();
+    expect(first).toHaveAttribute("aria-invalid", "true");
+    expect(second).toHaveAttribute("aria-invalid", "true");
+    expect(view.writes).toHaveLength(0);
+    fireEvent.change(first, { target: { value: "300" } });
+    fireEvent.change(second, { target: { value: "99" } });
+    expect(first).not.toHaveAttribute("aria-invalid", "true");
+    expect(second).not.toHaveAttribute("aria-invalid", "true");
+  });
+
+  it("reopens advanced notification settings for a missing required number", async () => {
+    const view = mount("/sites/site_test/settings/integration"), user = userEvent.setup();
+    const advanced = await screen.findByRole("button", { name: "高级设置" });
+    await user.click(advanced);
+    const attempts = screen.getByLabelText("最多发送次数");
+    fireEvent.change(attempts, { target: { value: "" } });
+    await user.click(advanced);
+    await user.click(screen.getByRole("button", { name: "保存业务网站" }));
+    expect(await screen.findByText("请输入最多发送次数。")).toBeVisible();
+    await waitFor(() => expect(attempts).toHaveFocus());
+    expect(attempts).toHaveAccessibleDescription("请输入最多发送次数。");
+    expect(view.writes).toHaveLength(0);
+  });
+
   it("explains notification and return prefix changes separately before saving", async () => {
     const view = mount("/sites/site_test/settings/integration");
     const user = userEvent.setup();
@@ -506,5 +597,57 @@ describe("website field feedback", () => {
     await user.click(await screen.findByRole("button", { name: "删除空业务网站" })); await user.click(await screen.findByRole("button", { name: "确认" }));
     await waitFor(() => expect(view.router.state.location.pathname).toBe("/sites"));
     expect(queryClient.getQueryData(["site-editor", "site_test"])).toBeUndefined();
+  });
+  it.each(["/orders", "/sites/site_test/settings/basic?view=changed"])("keeps the selected destination after a late deletion response: %s", async destination => {
+    const view = mount(), user = userEvent.setup(), pending = view.delayNextDelete();
+    queryClient.setQueryData(["workspace-site", "site_test"], { data: initial });
+    for (const key of ["sites", "site-overview", "settings"]) queryClient.setQueryData([key], { data: [] });
+    await user.click(await screen.findByRole("button", { name: "删除空业务网站" }));
+    await user.click(await screen.findByRole("button", { name: "确认" }));
+    await waitFor(() => expect(view.writes.filter(write => write.method === "DELETE")).toHaveLength(1));
+    await act(async () => { await view.router.navigate(destination); });
+    expect(view.router.state.location.pathname + view.router.state.location.search).toBe(destination);
+    await act(async () => { pending.release(); });
+    await waitFor(() => expect(queryClient.getQueryData(["site-editor", "site_test"])).toBeUndefined());
+    expect(view.router.state.location.pathname + view.router.state.location.search).toBe(destination);
+    expect(queryClient.getQueryData(["workspace-site", "site_test"])).toBeUndefined();
+    for (const key of ["sites", "site-overview", "settings"]) expect(queryClient.getQueryState([key])?.isInvalidated).toBe(true);
+  });
+  it("preserves a destination whose route is still loading when deletion completes", async () => {
+    const view = mount(), user = userEvent.setup();
+    const deletion = view.delayNextDelete(), navigation = view.delayNextNavigation();
+    await user.click(await screen.findByRole("button", { name: "删除空业务网站" }));
+    await user.click(await screen.findByRole("button", { name: "确认" }));
+    await waitFor(() => expect(view.writes.filter(write => write.method === "DELETE")).toHaveLength(1));
+    await act(async () => { void view.router.navigate("/orders"); });
+    await waitFor(() => expect(view.router.state.navigation.state).toBe("loading"));
+    try {
+      await act(async () => { deletion.release(); });
+      await waitFor(() => expect(queryClient.getQueryData(["site-editor", "site_test"])).toBeUndefined());
+      expect(view.router.state.navigation.location?.pathname).toBe("/orders");
+    } finally {
+      await act(async () => { navigation.release(); });
+    }
+    expect(await screen.findByRole("heading", { name: "订单目标页" })).toBeVisible();
+    expect(view.router.state.location.pathname).toBe("/orders");
+  });
+  it("preserves a navigation started in the same tick as the deletion response", async () => {
+    const view = mount(), user = userEvent.setup();
+    const deletion = view.delayNextDelete(), navigation = view.delayNextNavigation();
+    await user.click(await screen.findByRole("button", { name: "删除空业务网站" }));
+    await user.click(await screen.findByRole("button", { name: "确认" }));
+    await waitFor(() => expect(view.writes.filter(write => write.method === "DELETE")).toHaveLength(1));
+    try {
+      await act(async () => {
+        void view.router.navigate("/orders");
+        deletion.release();
+      });
+      await waitFor(() => expect(queryClient.getQueryData(["site-editor", "site_test"])).toBeUndefined());
+      expect(view.router.state.navigation.location?.pathname).toBe("/orders");
+    } finally {
+      await act(async () => { navigation.release(); });
+    }
+    expect(await screen.findByRole("heading", { name: "订单目标页" })).toBeVisible();
+    expect(view.router.state.location.pathname).toBe("/orders");
   });
 });

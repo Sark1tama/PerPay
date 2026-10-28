@@ -332,6 +332,13 @@ export function CheckoutApp({ initial }: { initial: CheckoutInitial }) {
                   >
                     {checkoutMoney(cents)}
                   </strong>
+                  {canPay && (
+                    <CopyValue
+                      value={(cents / 100).toFixed(2)}
+                      label="复制应付金额"
+                      buttonOnly
+                    />
+                  )}
                 </div>
                 {canPay && (
                   <>
@@ -489,12 +496,17 @@ export function CheckoutApp({ initial }: { initial: CheckoutInitial }) {
                     </Alert>
                   )}
                   {canPay && (
-                    <p
-                      className="hidden text-sm leading-relaxed text-muted-foreground lg:block"
-                      data-checkout-desktop-guide
-                    >
-                      <ExactAmountNotice desktop />
-                    </p>
+                    <div className="flex flex-col gap-2" data-checkout-payment-guide>
+                      <p
+                        className="hidden text-sm leading-relaxed text-muted-foreground lg:block"
+                        data-checkout-desktop-guide
+                      >
+                        用支付宝扫码，核对收款方。<ExactAmountNotice desktop />
+                      </p>
+                      <p className="text-sm leading-relaxed text-muted-foreground">
+                        付款后会自动查账确认；页面约每 2.5 秒更新状态。到账记录可能延迟，请勿重复付款。
+                      </p>
+                    </div>
                   )}
                 </CardContent>
               </section>
