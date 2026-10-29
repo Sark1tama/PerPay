@@ -22,8 +22,8 @@ import {
 
 describe("minimal onboarding", () => {
   it.each([
-    [1, "provider", "支付宝接入"],
-    [2, "collection", "支付宝经营码"],
+    [1, "provider", "支付宝账号"],
+    [2, "collection", "支付宝收款码"],
   ] as const)(
     "uses one step heading and separate contextual help without routine warnings for %s",
     async (stage, step, title) => {
@@ -31,7 +31,7 @@ describe("minimal onboarding", () => {
       await screen.findByRole("heading", { name: title });
       expect(screen.getAllByRole("heading", { level: 2 })).toHaveLength(1);
       if (step === "provider") {
-        expect(view.container.querySelector("form")).not.toHaveTextContent("支付宝接入");
+        expect(view.container.querySelector("form")).not.toHaveTextContent("支付宝账号");
         expect(screen.getByRole("group", { name: "开放平台应用" })).toBeVisible();
         expect(screen.queryByLabelText("常规查账间隔（秒）")).not.toBeInTheDocument();
       }

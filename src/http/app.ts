@@ -1,4 +1,6 @@
 import { assertSiteOrder, assertSiteResource, assertSiteLedger, SITE_ADMIN_ROUTES } from "../sites/admin-scope.ts";
+import { AlipayAccountError, alipayAccountIdSchema, createAlipayAccountInputSchema, updateAlipayAccountInputSchema, type AlipayAccountView } from "../alipay-accounts/model.ts";
+import type { AlipayAccountService } from "../alipay-accounts/service.ts";
 import { siteOverview } from "./site-overview.ts";
 import { collectionCodeInputSchema, providerApplicationInputSchema, instanceDisplayInputSchema } from "../settings/model.ts";
 import { SiteError, type SiteStore } from "../sites/store.ts";
@@ -7,6 +9,7 @@ import { collectionPolicyInputSchema } from "../settings/collection-policy.ts";
 import { readLedgerFailureDiagnostic, type LedgerDiagnostics } from "../ledger/diagnostics.ts";
 import { HealthProbeCache } from "../infrastructure/health-probe-cache.ts";
 import type { CheckoutVerification } from "../shared/checkout-verification.ts";
+import type { LedgerManualScanRequest, LedgerManualScanStatus } from "../shared/ledger-manual-scan.ts";
 import { adminAccessInputSchema, readAdminAccess, createAdminAccessPolicy } from "../settings/admin-access.ts";
 import { exportOrders, orderExportSchema } from "./order-export.ts";
 import { adminOrderIdentities, type OrderIdentitySummary } from "./admin-order-summary.ts";
@@ -202,8 +205,9 @@ const newPasswordValueSchema = z.string().refine(
 const loginSchema = z.object({ password: passwordValueSchema, remember_me: z.boolean().optional() }).strict();
 const setupSchema = z.object({
   password: newPasswordValueSchema,
-  setup_token: z.string().min(1).max(256),
+  setup_token: z.string().min(1).max(256).optional(),
 }).strict();
+const tokenProtectedSetupSchema = setupSchema.required({ setup_token: true });
 const settingsRevisionSchema = z.object({ revision: z.number().int().nonnegative() }).strict();
 const emptyObjectSchema = z.object({}).strict();
 const sessionIdSchema = z.uuid();
@@ -230,6 +234,8 @@ const ledgerConflictResolutionSchema = z.object({
 }).strict();
 
 export interface AppDependencies {
+  readonly alipayAccounts?: AlipayAccountService | undefined;
+  readonly accountHealth?: ((accountId: string) => { state: string; lastSuccessAt: number | null; lastErrorCode: string | null; collectionReady: boolean }) | undefined;
   readonly sites?: SiteStore | undefined;
   readonly config: AppConfig;
   readonly database: AppDatabase;
@@ -246,6 +252,8 @@ export interface AppDependencies {
   readonly backupHealth?: (() => BackupHealth | PromiseLike<BackupHealth>) | undefined;
   readonly ledger?: LedgerStore | undefined;
   readonly ledgerNextRunAt?: (() => number | null) | undefined;
+  readonly ledgerManualScan?: ((accountId?: string) => LedgerManualScanStatus) | undefined;
+  readonly requestLedgerScan?: ((accountId?: string) => LedgerManualScanRequest) | undefined;
   readonly ledgerHealth?: (() => LedgerSchedulerHealth & {
     readonly enabled: boolean;
     readonly paymentRevision?: number | null;
@@ -330,8 +338,12 @@ const disabledBackupHealth = Object.freeze({
 export function createApp(dependencies: AppDependencies): Hono<AppEnvironment> {
   const sites = dependencies.sites ?? dependencies.settings?.siteStore();
   if (sites && !dependencies.sites) dependencies = { ...dependencies, sites };
+  const alipayAccounts = dependencies.alipayAccounts ?? dependencies.settings?.accountService();
+  if (alipayAccounts && !dependencies.alipayAccounts) dependencies = { ...dependencies, alipayAccounts };
   const app = new Hono<AppEnvironment>();
-  const setupToken = dependencies.identity.isInitialized() ? null : new SetupToken(dependencies.onSetupToken);
+  const setupToken = dependencies.config.setupTokenEnabled && !dependencies.identity.isInitialized()
+    ? new SetupToken(dependencies.onSetupToken)
+    : null;
   const publicCheckoutBudget = new PublicCheckoutRateLimiter();
   const manualCheckoutBudget = new PublicCheckoutRateLimiter({sourceBurst:5,sourceRequestsPerSecond:1,globalBurst:30,globalRequestsPerSecond:10});
   const collectionCodeCache = new CollectionCodeSvgCache();
@@ -472,7 +484,7 @@ export function createApp(dependencies: AppDependencies): Hono<AppEnvironment> {
     if (path.startsWith("/admin/assets/") || /\.[^/]+$/.test(path)) {
       throw new HttpApiError(404, "asset_not_found", "静态资源不存在");
     }
-    return context.html(adminFrontend.render(dependencies.identity.isInitialized(), publicSystemName(dependencies)).replace("<html", dependencies.demoMode ? '<html data-perpay-demo="readonly"' : "<html"));
+    return context.html(adminFrontend.render(dependencies.identity.isInitialized(), publicSystemName(dependencies), dependencies.config.setupTokenEnabled).replace("<html", dependencies.demoMode ? '<html data-perpay-demo="readonly"' : "<html"));
   };
   app.get("/admin", (context) => context.redirect("/admin/" + new URL(context.req.url).search, 308));
   app.get("/admin/*", serveAdmin);
@@ -493,7 +505,7 @@ export function createApp(dependencies: AppDependencies): Hono<AppEnvironment> {
     let status: 200 | 404 | 503 = 200;
     try {
       checkout = dependencies.orders.publicCheckout(token);
-      if (checkout.paymentInstructions !== null) requirePaymentEntryReady(dependencies);
+      if (checkout.paymentInstructions !== null) requirePaymentEntryReady(dependencies, dependencies.orders.publicCheckoutOrderId(token));
     } catch (error) {
       if (error instanceof OrderError) {
         if (error.code === "checkout_not_found") {
@@ -554,9 +566,9 @@ export function createApp(dependencies: AppDependencies): Hono<AppEnvironment> {
     }
     const checkout = dependencies.orders.publicCheckout(context.req.param("token"));
     if (checkout.paymentInstructions === null) {
-      throw new HttpApiError(404, "checkout_code_not_found", "经营码不可用");
+      throw new HttpApiError(404, "checkout_code_not_found", "收款码不可用");
     }
-    requirePaymentEntryReady(dependencies);
+    requirePaymentEntryReady(dependencies, dependencies.orders.publicCheckoutOrderId(context.req.param("token")));
     let svg: string;
     try {
       svg = collectionCodeCache.render(checkout.paymentInstructions.collectionCodePayload);
@@ -565,7 +577,7 @@ export function createApp(dependencies: AppDependencies): Hono<AppEnvironment> {
       throw new HttpApiError(
         503,
         "checkout_code_generation_failed",
-        "经营码暂时无法生成",
+        "收款码暂时无法生成",
         5,
       );
     }
@@ -581,15 +593,15 @@ export function createApp(dependencies: AppDependencies): Hono<AppEnvironment> {
       setupToken?.consume();
       throw new HttpApiError(409, "identity_already_initialized", "管理员身份已经初始化");
     }
-    const body = await readJson(context, setupSchema, MAX_JSON_BODY_BYTES);
-    if (!setupToken?.matches(body.setup_token)) {
+    const body = await readJson(context, dependencies.config.setupTokenEnabled ? tokenProtectedSetupSchema : setupSchema, MAX_JSON_BODY_BYTES);
+    if (dependencies.config.setupTokenEnabled && !setupToken?.matches(body.setup_token ?? "")) {
       throw new HttpApiError(403, "setup_token_invalid", "初始化令牌无效或已失效，请从服务器最新启动日志重新获取。");
     }
     await dependencies.identity.setupAdmin(
       body.password,
       identityContext(context, dependencies.config.trustedProxy),
     );
-    setupToken.consume();
+    setupToken?.consume();
     return context.body(null, 204);
   });
 
@@ -652,12 +664,35 @@ export function createApp(dependencies: AppDependencies): Hono<AppEnvironment> {
     context.json({ data: await systemStatus(dependencies, true) }),
   );
 
-  app.get("/api/admin/v1/system/update", adminSession, async (context) => {
+  app.post("/api/admin/v1/system/ledger/scan", adminSession, async (context) => {
+    requireJsonContentType(context);
+    requireSameOrigin(context, dependencies.config.publicOrigin);
+    requireCsrf(context, dependencies.identity, dependencies.config.secureCookies);
+    const body = await readJson(context, z.object({ alipay_account_id: alipayAccountIdSchema.optional() }).strict(), MAX_JSON_BODY_BYTES);
     if (new URL(context.req.url).searchParams.size !== 0) {
-      throw new HttpApiError(422, "validation_failed", "更新检查不接受自定义来源或查询参数");
+      throw new HttpApiError(422, "validation_failed", "手动查账不接受查询参数");
+    }
+    if (dependencies.demoMode) throw new HttpApiError(403, "demo_read_only", "当前操作不可用。");
+    const scan = body.alipay_account_id ? dependencies.ledgerManualScan?.(body.alipay_account_id) : currentLedgerManualScan(dependencies, dependencies.database.health().ok);
+    if (!dependencies.database.health().ok || !scan?.available || !dependencies.requestLedgerScan) {
+      throw new HttpApiError(503, "ledger_scan_unavailable", "当前无法发起手动查账，请稍后重试");
+    }
+    let request: LedgerManualScanRequest;
+    try { request = dependencies.requestLedgerScan(body.alipay_account_id); }
+    catch { throw new HttpApiError(503, "ledger_scan_unavailable", "当前无法发起手动查账，请稍后重试"); }
+    return context.json({ data: request }, 202);
+  });
+
+  app.get("/api/admin/v1/system/update", adminSession, async (context) => {
+    const values = new URL(context.req.url).searchParams;
+    const channels = values.getAll("channel");
+    const channel = channels[0] ?? "prerelease";
+    if ([...values.keys()].some(key => key !== "channel") || channels.length > 1 ||
+      (channel !== "stable" && channel !== "prerelease")) {
+      throw new HttpApiError(422, "validation_failed", "更新检查只接受单个有效的 channel 参数");
     }
     try {
-      return context.json({ data: await updateChecker.check() });
+      return context.json({ data: await updateChecker.check(channel) });
     } catch (error) {
       if (!(error instanceof UpdateCheckUnavailable)) throw error;
       context.header("retry-after", String(error.retryAfterSeconds));
@@ -735,7 +770,7 @@ export function createApp(dependencies: AppDependencies): Hono<AppEnvironment> {
     requireSameOrigin(context, dependencies.config.publicOrigin);
     requireCsrf(context, dependencies.identity, dependencies.config.secureCookies);
     await readJson(context, emptyObjectSchema, MAX_JSON_BODY_BYTES);
-    if (dependencies.demoMode) throw new HttpApiError(403, "demo_read_only", "只读演示不执行写操作");
+    if (dependencies.demoMode) throw new HttpApiError(403, "demo_read_only", "当前操作不可用。");
     const revoked = dependencies.identity.revokeOtherSessions(
       context.get("adminSession"),
       identityContext(context, dependencies.config.trustedProxy),
@@ -750,7 +785,7 @@ export function createApp(dependencies: AppDependencies): Hono<AppEnvironment> {
     const target = sessionIdSchema.safeParse(context.req.param("session_id"));
     if (!target.success) throw new HttpApiError(422, "validation_failed", "会话标识必须是有效的 UUID");
     await readJson(context, emptyObjectSchema, MAX_JSON_BODY_BYTES);
-    if (dependencies.demoMode) throw new HttpApiError(403, "demo_read_only", "只读演示不执行写操作");
+    if (dependencies.demoMode) throw new HttpApiError(403, "demo_read_only", "当前操作不可用。");
     const session = context.get("adminSession");
     const targetSessionId = target.data.toLowerCase();
     dependencies.identity.revokeSession(
@@ -872,7 +907,7 @@ export function createApp(dependencies: AppDependencies): Hono<AppEnvironment> {
       return parsed.data;
     };
     const siteWrite = (context: Context<AppEnvironment>) => {
-      if (dependencies.demoMode) throw new HttpApiError(403, "demo_read_only", "只读演示不允许修改网站配置。");
+      if (dependencies.demoMode) throw new HttpApiError(403, "demo_read_only", "当前操作不可用。");
       requireCurrentSession(context, dependencies.identity);
       return settingsAuditContext(context, dependencies);
     };
@@ -929,7 +964,7 @@ export function createApp(dependencies: AppDependencies): Hono<AppEnvironment> {
   app.get("/api/admin/v1/settings/collection-policy", adminSession, context => context.json({ data: requireSettingsService(dependencies).collectionPolicy() }));
   app.put("/api/admin/v1/settings/collection-policy", adminSession, financialWrite, async context => {
     const body = await readJson(context, collectionPolicyInputSchema, MAX_JSON_BODY_BYTES);
-    if (dependencies.demoMode) throw new HttpApiError(403, "demo_read_only", "只读演示不允许修改查账设置。");
+    if (dependencies.demoMode) throw new HttpApiError(403, "demo_read_only", "当前操作不可用。");
     requireCurrentSession(context, dependencies.identity);
     const data = await settingsOperation(() => requireSettingsService(dependencies).saveCollectionPolicy(body, settingsAuditContext(context, dependencies)));
     return context.json({ data: data });
@@ -979,6 +1014,57 @@ export function createApp(dependencies: AppDependencies): Hono<AppEnvironment> {
     return context.json({ data: requireSettingsService(dependencies).publicView() });
   });
 
+  if (alipayAccounts) {
+    for (const path of ["/api/admin/v1/settings/provider", "/api/admin/v1/settings/provider/*", "/api/admin/v1/settings/collection"]) {
+      app.use(path, adminSession, financialWrite, () => {
+        throw new HttpApiError(410, "alipay_settings_moved", "支付宝配置已迁移到“支付宝账号”，请打开对应账号后修改。");
+      });
+    }
+    const accountId = (context: Context<AppEnvironment>) => {
+      const parsed = alipayAccountIdSchema.safeParse(context.req.param("accountId"));
+      if (!parsed.success) throw new HttpApiError(404, "alipay_account_not_found", "支付宝账号不存在。");
+      return parsed.data;
+    };
+    const accountView = (account: AlipayAccountView) => serializeAlipayAccount(account, dependencies);
+    app.get("/api/admin/v1/alipay-accounts", adminSession, context => context.json({ data: alipayAccounts.list().map(accountView) }));
+    app.get("/api/admin/v1/alipay-accounts/:accountId", adminSession, context => context.json({ data: accountView(alipayAccounts.get(accountId(context))) }));
+    app.post("/api/admin/v1/alipay-accounts", adminSession, financialWrite, async context => {
+      const body = await readJson(context, createAlipayAccountInputSchema, MAX_JSON_BODY_BYTES);
+      const data = await alipayAccounts.create(body, settingsAuditContext(context, dependencies));
+      context.header("location", `/api/admin/v1/alipay-accounts/${encodeURIComponent(data.id)}`);
+      return context.json({ data: accountView(data) }, 201);
+    });
+    app.put("/api/admin/v1/alipay-accounts/:accountId", adminSession, financialWrite, async context => {
+      const body = await readJson(context, updateAlipayAccountInputSchema, MAX_JSON_BODY_BYTES);
+      return context.json({ data: accountView(await alipayAccounts.update(accountId(context), body, settingsAuditContext(context, dependencies))) });
+    });
+    app.delete("/api/admin/v1/alipay-accounts/:accountId", adminSession, financialWrite, async context => {
+      const body = await readJson(context, settingsRevisionSchema, MAX_JSON_BODY_BYTES);
+      await alipayAccounts.remove(accountId(context), body, settingsAuditContext(context, dependencies));
+      return context.body(null, 204);
+    });
+    app.post("/api/admin/v1/alipay-accounts/:accountId/check", adminSession, financialWrite, async context => {
+      await readJson(context, emptyObjectSchema, MAX_JSON_BODY_BYTES);
+      return context.json({ data: await alipayAccounts.check(accountId(context), { signal: context.req.raw.signal }) });
+    });
+    app.post("/api/admin/v1/alipay-accounts/:accountId/application-key", adminSession, financialWrite, async context => {
+      const body = await readJson(context, settingsRevisionSchema, MAX_JSON_BODY_BYTES);
+      return context.json({ data: accountView(await alipayAccounts.generateApplicationKey(accountId(context), body, settingsAuditContext(context, dependencies))) });
+    });
+    app.post("/api/admin/v1/alipay-accounts/:accountId/application-key/regenerate", adminSession, financialWrite, async context => {
+      const body = await readJson(context, regenerateProviderApplicationKeySchema, MAX_JSON_BODY_BYTES);
+      return context.json({ data: accountView(await alipayAccounts.regenerateApplicationKey(accountId(context), body, settingsAuditContext(context, dependencies))) });
+    });
+    app.post("/api/admin/v1/alipay-accounts/:accountId/application-key/activate", adminSession, financialWrite, async context => {
+      const body = await readJson(context, activateProviderApplicationKeySchema, MAX_JSON_BODY_BYTES);
+      return context.json({ data: accountView(await alipayAccounts.activateApplicationKey(accountId(context), body, settingsAuditContext(context, dependencies), { signal: context.req.raw.signal })) });
+    });
+    app.post("/api/admin/v1/alipay-accounts/:accountId/application-key/discard", adminSession, financialWrite, async context => {
+      const body = await readJson(context, applicationKeyChangeActionSchema, MAX_JSON_BODY_BYTES);
+      return context.json({ data: accountView(await alipayAccounts.discardApplicationKey(accountId(context), body, settingsAuditContext(context, dependencies))) });
+    });
+  }
+
   app.post(
     "/api/admin/v1/test-payments",
     adminSession,
@@ -1015,7 +1101,8 @@ export function createApp(dependencies: AppDependencies): Hono<AppEnvironment> {
           error_type: error instanceof Error ? error.name : "unknown_error",
         }));
       }
-      const data = serializeOrder(result.order, dependencies.config.publicOrigin);
+      const identity = adminOrderIdentities(dependencies.database, [result.order.orderId]).get(result.order.orderId);
+      const data = { ...serializeOrder(result.order, dependencies.config.publicOrigin), alipay_account_id: identity?.alipay_account_id ?? null, alipay_account_name: identity?.alipay_account_name ?? null };
       context.header("location", administratorEndpoint(context, `/orders/${encodeURIComponent(result.order.orderId)}`));
       return context.json({ data }, result.created ? 201 : 200);
     },
@@ -1217,6 +1304,7 @@ export function createApp(dependencies: AppDependencies): Hono<AppEnvironment> {
     async (context) => {
       await readJson(context, emptyObjectSchema, MAX_JSON_BODY_BYTES);
       const name = context.req.param("name");
+      if (alipayAccounts && (name === "provider_private_key" || name === "provider_public_key")) throw new HttpApiError(410, "alipay_settings_moved", "支付宝密钥已迁移到对应账号。");
       if (dependencies.sites && (name === "api_secret" || name === "webhook_secret")) throw new HttpApiError(410, "site_settings_moved", "业务密钥已迁移至对应业务网站。");
       if (!runtimeSecretNames.has(name)) {
         throw new HttpApiError(404, "secret_not_found", "密钥不存在");
@@ -1232,10 +1320,10 @@ export function createApp(dependencies: AppDependencies): Hono<AppEnvironment> {
   );
 
   app.get("/api/admin/v1/ledger/entries", adminSession, (context) => {
-    const environment = resolveAdminLedgerEnvironment(dependencies.database,
+    const environment = alipayAccounts ? null : resolveAdminLedgerEnvironment(dependencies.database,
       () => dependencies.settings?.instanceSnapshot().provider?.environment);
     const query = readAdminLedgerPageQuery(new URL(context.req.url).searchParams, environment);
-    if (environment === null) return context.json({ data: [], page: { next_cursor: null }, environment });
+    if (environment === null && !alipayAccounts) return context.json({ data: [], page: { next_cursor: null }, environment });
     const page = readAdminLedgerPage(dependencies.database, { ...query, environment });
     return context.json({ data: page.items, page: { next_cursor: encodeAdminLedgerCursor(page.next_cursor, query) }, environment });
   });
@@ -1244,7 +1332,7 @@ export function createApp(dependencies: AppDependencies): Hono<AppEnvironment> {
     if (new URL(context.req.url).searchParams.size !== 0) throw new ListQueryError("流水详情不接受查询参数");
     const id = requireResourceId(context.req.param("ledgerEntryId"), "ledger_entry_not_found", "支付宝流水不存在");
     const environment = adminLedgerEntryEnvironment(dependencies.database, id);
-    const detail = environment === null ? null : readAdminLedgerDetail(dependencies.database, environment, id);
+    const detail = environment === null ? null : readAdminLedgerDetail(dependencies.database, environment, id, Boolean(alipayAccounts));
     if (!detail) throw new HttpApiError(404, "ledger_entry_not_found", "支付宝流水不存在");
     return context.json({ data: detail });
   });
@@ -1252,9 +1340,9 @@ export function createApp(dependencies: AppDependencies): Hono<AppEnvironment> {
   app.get("/api/admin/v1/ledger/conflicts", adminSession, (context) => {
     const query = readLedgerConflictPageQuery(
       context,
-      currentRuntimeStatus(dependencies).activeProviderAccountKey,
+      alipayAccounts ? null : currentRuntimeStatus(dependencies).activeProviderAccountKey,
     );
-    if (query.providerAccountKey === null) {
+    if (query.providerAccountKey === null && !alipayAccounts) {
       return context.json({ data: [], page: { next_cursor: null } });
     }
     const page = requireLedgerStore(dependencies)
@@ -1417,9 +1505,9 @@ export function createApp(dependencies: AppDependencies): Hono<AppEnvironment> {
   app.get("/api/admin/v1/reconciliation/exceptions", adminSession, (context) => {
     const query = readExceptionPageQuery(
       context,
-      currentRuntimeStatus(dependencies).activeProviderAccountKey,
+      alipayAccounts ? null : currentRuntimeStatus(dependencies).activeProviderAccountKey,
     );
-    if (query.providerAccountKey === null) {
+    if (query.providerAccountKey === null && !alipayAccounts) {
       return context.json({ data: [], page: { next_cursor: null } });
     }
     const page = requireReconciliationStore(dependencies)
@@ -1672,7 +1760,7 @@ export function createApp(dependencies: AppDependencies): Hono<AppEnvironment> {
 
   app.post("/api/public/v1/checkouts/:token/check", async (context) => {
     requireSameOrigin(context, dependencies.config.publicOrigin);
-    if (dependencies.demoMode) throw new HttpApiError(403, "origin_not_allowed", "只读演示不能发起支付宝查账");
+    if (dependencies.demoMode) throw new HttpApiError(403, "origin_not_allowed", "当前操作不可用。");
     if (!manualCheckoutBudget.take(remoteAddress(context, dependencies.config.trustedProxy))) {
       throw new HttpApiError(429, "public_checkout_rate_limited", "手动核实过于频繁，请稍后重试", 5);
     }
@@ -1682,7 +1770,7 @@ export function createApp(dependencies: AppDependencies): Hono<AppEnvironment> {
     const orderId = dependencies.orders.publicCheckoutOrderId(token);
     let verification = dependencies.checkoutVerification?.(orderId);
     if (checkout.checkout.status === "OPEN" && checkout.payment.status === "UNPAID") {
-      requirePaymentEntryReady(dependencies);
+      requirePaymentEntryReady(dependencies, orderId);
       if (!dependencies.requestCheckoutVerification) throw new HttpApiError(503, "system_not_ready", "暂时无法发起付款核实");
       try { verification = dependencies.requestCheckoutVerification(orderId); }
       catch { throw new HttpApiError(503, "system_not_ready", "付款核实暂时不可用，请稍后重试"); }
@@ -1704,7 +1792,7 @@ export function createApp(dependencies: AppDependencies): Hono<AppEnvironment> {
       );
     }
     const checkout = dependencies.orders.publicCheckout(context.req.param("token"));
-    if (checkout.paymentInstructions !== null) requirePaymentEntryReady(dependencies);
+    if (checkout.paymentInstructions !== null) requirePaymentEntryReady(dependencies, dependencies.orders.publicCheckoutOrderId(context.req.param("token")));
     const verification = dependencies.checkoutVerification?.(dependencies.orders.publicCheckoutOrderId(context.req.param("token")));
     return context.json({ data: { ...serializePublicCheckout(checkout), ...(verification ? {verification} : {}) } });
   });
@@ -1718,6 +1806,9 @@ export function createApp(dependencies: AppDependencies): Hono<AppEnvironment> {
       try {
         dependencies.sites.checkOrderAdmission(clientId, dependencies.clock?.() ?? Date.now());
         requirePaymentEntryReady(dependencies);
+        if (dependencies.accountHealth && !site.configuration.collection?.accounts.some(account => dependencies.accountHealth!(account.account_id).collectionReady)) {
+          throw new HttpApiError(503, "alipay_accounts_unavailable", "这个网站的收款账号当前都不可用。");
+        }
       } catch (error) {
         if (error instanceof SiteError || error instanceof HttpApiError) code = error.code;
         else throw error;
@@ -1734,7 +1825,7 @@ export function createApp(dependencies: AppDependencies): Hono<AppEnvironment> {
       if (!siteClientIdSchema.safeParse(clientId).success || !dependencies.sites!.get(clientId)) throw new HttpApiError(404, "site_not_found", "业务网站不存在");
       const values = new URL(context.req.url).searchParams;
       if (values.has("api_client_id")) throw new HttpApiError(422, "validation_failed", "网站身份只能由路径指定");
-      if (dependencies.demoMode && !["GET", "HEAD"].includes(context.req.method) && !context.req.path.endsWith("/orders/export")) throw new HttpApiError(403, "demo_read_only", "只读演示不执行写操作");
+      if (dependencies.demoMode && !["GET", "HEAD"].includes(context.req.method) && !context.req.path.endsWith("/orders/export")) throw new HttpApiError(403, "demo_read_only", "当前操作不可用。");
       context.set("adminSiteId", clientId);
       dependencies.database.read(db => {
         for (const [param, kind] of [["orderId", "order"], ["deliveryId", "delivery"], ["paymentMatchId", "match"], ["candidateId", "candidate"], ["exceptionId", "exception"]] as const) {
@@ -1761,9 +1852,12 @@ export function createApp(dependencies: AppDependencies): Hono<AppEnvironment> {
   );
 
   app.onError((error, context) => {
+    if (error instanceof AlipayAccountError) {
+      return errorResponse(context, error.code === "alipay_account_not_found" ? 404 : 409, error.code, error.message);
+    }
     if (error instanceof SiteError) {
       if (error.retryAfterSeconds !== undefined) context.header("retry-after", String(error.retryAfterSeconds));
-      const status = error.code === "site_not_found" ? 404 : error.code === "site_paused" || error.code === "site_order_limit_exceeded" ? 503 : 409;
+      const status = error.code === "site_not_found" ? 404 : error.code === "site_paused" || error.code === "site_order_limit_exceeded" ? 503 : error.code === "site_collection_required" || error.code === "site_collection_invalid" ? 422 : 409;
       return errorResponse(context, status, error.code, error.message);
     }
     if (error instanceof AdminOperationError) return errorResponse(context, error.status, error.code, error.message);
@@ -2161,7 +2255,7 @@ function parseJsonBytes<T>(bytes: Uint8Array, schema: z.ZodType<T>): T {
   if (!parsed.success) {
     if ((schema as z.ZodType) === collectionSettingsInputSchema || (schema as z.ZodType) === collectionCodeInputSchema) {
       const issue = parsed.error.issues.find((item) => item.path[0] === "code_payload");
-      if (issue) throw new SettingsFieldError("code_payload", "请上传支付宝经营码，或粘贴 qr.alipay.com 开头的完整收款链接（最多 2331 字节）。");
+      if (issue) throw new SettingsFieldError("code_payload", "请上传支付宝收款码，或粘贴 qr.alipay.com 开头的完整收款链接（最多 2331 字节）。");
     }
     if ((schema as z.ZodType) === providerSettingsInputSchema || (schema as z.ZodType) === collectionPolicyInputSchema) {
       const timingHints = {
@@ -2178,7 +2272,7 @@ function parseJsonBytes<T>(bytes: Uint8Array, schema: z.ZodType<T>): T {
     if ((schema as z.ZodType) === adminAccessInputSchema) {
       throw new SettingsFieldError("cidrs", parsed.error.issues[0]?.message ?? "白名单格式错误");
     }
-    if ([createSiteInputSchema, updateSiteInputSchema, updateSiteDefaultsInputSchema].some(candidate => (candidate as z.ZodType) === schema)) {
+    if ([createSiteInputSchema, updateSiteInputSchema, updateSiteDefaultsInputSchema, createAlipayAccountInputSchema, updateAlipayAccountInputSchema].some(candidate => (candidate as z.ZodType) === schema)) {
       const issue = parsed.error.issues[0];
       if (issue?.path.length) throw new SettingsFieldError(issue.path.join("."), issue.message);
     }
@@ -2380,10 +2474,10 @@ function operationalSummaries(
   let conflicts: LedgerConflictSummary | null = null;
   let exceptions: FinancialExceptionSummary | null = null;
   let unavailable = false;
-  const providerAccountKey = currentRuntimeStatus(dependencies).activeProviderAccountKey;
+  const providerAccountKey = dependencies.alipayAccounts ? null : currentRuntimeStatus(dependencies).activeProviderAccountKey;
   if (dependencies.ledger) {
     try {
-      conflicts = providerAccountKey
+      conflicts = dependencies.alipayAccounts || providerAccountKey
         ? dependencies.ledger.conflictSummary(providerAccountKey)
         : null;
     } catch {
@@ -2392,7 +2486,7 @@ function operationalSummaries(
   }
   if (dependencies.reconciliation) {
     try {
-      exceptions = providerAccountKey
+      exceptions = dependencies.alipayAccounts || providerAccountKey
         ? dependencies.reconciliation.exceptionSummary(providerAccountKey)
         : null;
     } catch {
@@ -2408,6 +2502,11 @@ function operationalSummaries(
   return { conflicts, exceptions, workItems, unavailable };
 }
 
+function serializeAlipayAccount(account: AlipayAccountView, dependencies: AppDependencies) {
+  const health = dependencies.accountHealth?.(account.id);
+  return { ...account, ...(health ? { health: { state: health.state, last_success_at: nullableIsoTime(health.lastSuccessAt), last_error_code: health.lastErrorCode, collection_ready: health.collectionReady }, manual_scan: dependencies.ledgerManualScan?.(account.id) } : {}) };
+}
+
 async function systemStatus(dependencies: AppDependencies, administrator = false) {
   const database = dependencies.database.health();
   const runtime = currentRuntimeStatus(dependencies);
@@ -2419,6 +2518,7 @@ async function systemStatus(dependencies: AppDependencies, administrator = false
   const operations = operationalSummaries(dependencies, database.ok);
   // Capture diagnostics with the same synchronous runtime snapshot before awaiting backup I/O.
   const diagnostics = administrator ? ledgerDiagnostics(dependencies, runtime, ledger) : undefined;
+  const manualScan = administrator ? currentLedgerManualScan(dependencies, database.ok) : undefined;
   const backup = await currentBackupHealth(dependencies);
   const configured = dependencies.identity.isInitialized() && runtime.configured;
   const ready = database.ok && configured && !runtime.transitioning &&
@@ -2445,6 +2545,7 @@ async function systemStatus(dependencies: AppDependencies, administrator = false
     ledger: {
       ...serializeLedgerHealth(ledger, collection),
       ...(diagnostics ? { diagnostics } : {}),
+      ...(manualScan ? { manual_scan: manualScan } : {}),
       conflicts: serializeLedgerConflictSummary(operations.conflicts),
     },
     reconciliation: {
@@ -2454,8 +2555,21 @@ async function systemStatus(dependencies: AppDependencies, administrator = false
     webhook: serializeWebhookHealth(webhook),
     work_items: operations.workItems,
     ...(dependencies.settings ? { backup_policy: dependencies.settings.publicView().backup } : {}),
+    ...(administrator && dependencies.alipayAccounts ? { alipay_accounts: dependencies.alipayAccounts.list().map(account => serializeAlipayAccount(account, dependencies)) } : {}),
     backup,
   };
+}
+
+function currentLedgerManualScan(dependencies: AppDependencies, databaseOk: boolean): LedgerManualScanStatus {
+  let status: LedgerManualScanStatus;
+  try {
+    status = dependencies.ledgerManualScan?.() ?? { available: false, unavailable_reason: "not_configured", request: null };
+  } catch {
+    status = { available: false, unavailable_reason: "storage_unavailable", request: null };
+  }
+  const reason = dependencies.demoMode ? "demo_read_only" : !databaseOk ? "database_unavailable"
+    : !dependencies.requestLedgerScan && status.available ? "stopped" : status.unavailable_reason;
+  return { ...status, available: status.available && reason === null, unavailable_reason: reason };
 }
 
 function ledgerDiagnostics(
@@ -2537,6 +2651,12 @@ function collectionFreshness(
 ): CollectionFreshness {
   const runtime = currentRuntimeStatus(dependencies);
   const maximumSuccessAgeMilliseconds = runtime.maximumSuccessAgeMilliseconds;
+  if (dependencies.accountHealth && dependencies.alipayAccounts) {
+    const accounts = dependencies.alipayAccounts.list();
+    const ready = accounts.some(account => dependencies.accountHealth!(account.id).collectionReady);
+    const age = health.lastSuccessAt === null ? null : (dependencies.clock?.() ?? Date.now()) - health.lastSuccessAt;
+    return { ready, lastSuccessAgeMilliseconds: age !== null && age >= 0 ? age : null, maximumSuccessAgeMilliseconds };
+  }
   if (
     !runtime.configured ||
     runtime.transitioning ||
@@ -2590,11 +2710,11 @@ function confirmationFreshness(
   const runtime = currentRuntimeStatus(dependencies);
   const maximumSuccessAgeMilliseconds = runtime.maximumSuccessAgeMilliseconds;
   if (
-    !runtime.configured ||
+    (!dependencies.accountHealth && !runtime.configured) ||
     runtime.transitioning ||
     maximumSuccessAgeMilliseconds === null ||
     !health.enabled ||
-    health.paymentRevision !== runtime.paymentRevision ||
+    (!dependencies.accountHealth && health.paymentRevision !== runtime.paymentRevision) ||
     health.state === "stopped" ||
     health.lastSuccessAt === null
   ) {
@@ -2621,9 +2741,18 @@ function confirmationFreshness(
   };
 }
 
-function requirePaymentEntryReady(dependencies: AppDependencies): void {
+function requirePaymentEntryReady(dependencies: AppDependencies, orderId?: string): void {
   requirePaymentDatabaseReady(dependencies);
   requirePaymentBackgroundReady(dependencies);
+  if (orderId && dependencies.accountHealth) {
+    const order = dependencies.orders.adminGet(orderId);
+    const health = dependencies.accountHealth(order.alipayAccountId);
+    const age = health.lastSuccessAt === null ? Infinity : (dependencies.clock?.() ?? Date.now()) - health.lastSuccessAt;
+    const maximum = currentRuntimeStatus(dependencies).maximumSuccessAgeMilliseconds ?? 0;
+    if (["unconfigured", "transitioning", "stopped"].includes(health.state) || health.lastErrorCode !== null || age < 0 || age > maximum) {
+      throw new HttpApiError(503, "reconciliation_not_ready", "这笔订单的收款账号暂时无法查账，请稍后重试。", 5);
+    }
+  }
 }
 
 function requirePaymentDatabaseReady(dependencies: AppDependencies): void {
@@ -2639,7 +2768,7 @@ function requirePaymentDatabaseReady(dependencies: AppDependencies): void {
 
 function requirePaymentBackgroundReady(dependencies: AppDependencies): void {
   const runtime = currentRuntimeStatus(dependencies);
-  if (!dependencies.identity.isInitialized() || !runtime.configured) {
+  if (!dependencies.identity.isInitialized() || (!dependencies.accountHealth && !runtime.configured)) {
     throw new HttpApiError(
       503,
       "system_not_configured",
@@ -2651,7 +2780,7 @@ function requirePaymentBackgroundReady(dependencies: AppDependencies): void {
     1,
     Math.ceil((runtime.scanIntervalMilliseconds ?? 5_000) / 1_000),
   );
-  if (!collectionFreshness(dependencies, currentLedgerHealth(dependencies)).ready) {
+  if (!dependencies.accountHealth && !collectionFreshness(dependencies, currentLedgerHealth(dependencies)).ready) {
     throw new HttpApiError(
       503,
       "reconciliation_not_ready",
@@ -2710,6 +2839,7 @@ function orderStatus(code: OrderErrorCode): 404 | 409 | 422 | 503 {
     case "merchant_order_no_conflict":
       return 409;
     case "amount_slots_exhausted":
+    case "alipay_accounts_unavailable":
     case "order_clock_unavailable":
     case "system_not_configured":
       return 503;
@@ -2908,7 +3038,7 @@ function readAdminOrderPageQuery(context: Context<AppEnvironment>): {
   const query = readListQuery(values, ORDER_SORT_FIELDS, "created_at", "desc");
   for (const key of values.keys()) {
     if (
-      key !== "api_client_id" && key !== "limit" &&
+      key !== "api_client_id" && key !== "alipay_account_id" && key !== "limit" &&
       key !== "checkout_status" &&
       key !== "payment_status" &&
       key !== "cursor" && key !== "q" && key !== "sort_by" && key !== "sort_order" && key !== "created_from" && key !== "created_to"
@@ -2946,7 +3076,10 @@ function readAdminOrderPageQuery(context: Context<AppEnvironment>): {
   }
   const clientIds = values.getAll("api_client_id");
   if (clientIds.length > 1 || (clientIds.length === 1 && !siteClientIdSchema.safeParse(clientIds[0]).success)) throw new HttpApiError(422, "validation_failed", "网站筛选无效。");
+  const accountIds = values.getAll("alipay_account_id");
+  if (accountIds.length > 1 || (accountIds.length === 1 && !alipayAccountIdSchema.safeParse(accountIds[0]).success)) throw new HttpApiError(422, "validation_failed", "收款账号筛选无效。");
   const filters: AdminOrderFilters = {
+    ...(accountIds[0] ? { alipayAccountId: accountIds[0] } : {}),
     ...(clientIds[0] ? { apiClientId: clientIds[0] } : {}),
     checkoutStatus: checkoutStatus === null ? null : checkoutStatus.data,
     paymentStatus: paymentStatus === null ? null : paymentStatus.data,
@@ -2979,7 +3112,7 @@ function decodeAdminOrderCursor(
     if (!ORDER_ID_PATTERN.test(position.keys[0]!) || (position.value === null && query.sortBy !== "received_amount_cents")) throw new ListQueryError("分页游标无效");
     return {createdAt: query.sortBy === "created_at" ? position.value as number : 0, orderId: position.keys[0]!, position};
   }
-  if (expectedFilters.apiClientId || !isDefaultQuery(query, "created_at", "desc")) throw new ListQueryError("旧游标仅能用于未按网站筛选的默认查询");
+  if (expectedFilters.apiClientId || expectedFilters.alipayAccountId || !isDefaultQuery(query, "created_at", "desc")) throw new ListQueryError("旧游标仅能用于未按网站或账号筛选的默认查询");
   if (!/^[A-Za-z0-9_-]{1,256}$/.test(value)) {
     throw new HttpApiError(422, "validation_failed", "查询参数校验失败");
   }
@@ -3065,7 +3198,7 @@ function readLedgerConflictPageQuery(
   };
 }
 
-function encodeLedgerConflictCursor(cursor: LedgerConflictCursor | null, status: LedgerConflictStatus | "ALL", providerAccountKey: string, query: ListQuery<ConflictSort>): string | null {
+function encodeLedgerConflictCursor(cursor: LedgerConflictCursor | null, status: LedgerConflictStatus | "ALL", providerAccountKey: string | null, query: ListQuery<ConflictSort>): string | null {
   return encodeListCursor("conflicts", [query, status, providerAccountKey], cursor ? cursor.position ?? {value: cursor.createdAt, keys: [cursor.conflictId]} : null);
 }
 
@@ -3077,7 +3210,7 @@ function decodeLedgerConflictCursor(
 ): LedgerConflictCursor {
   const position = decodeListCursor(value, "conflicts", [query, expectedStatus, expectedProviderAccountKey], query.sortBy === "external_event_id" ? "string" : "number");
   if (position) {
-    if (expectedProviderAccountKey === null || !ORDER_ID_PATTERN.test(position.keys[0]!) || (position.value === null && query.sortBy !== "external_event_id")) throw new ListQueryError("分页游标无效");
+    if (!ORDER_ID_PATTERN.test(position.keys[0]!) || (position.value === null && query.sortBy !== "external_event_id")) throw new ListQueryError("分页游标无效");
     return {createdAt: query.sortBy === "created_at" ? position.value as number : 0, conflictId: position.keys[0]!, position};
   }
   if (!isDefaultQuery(query, "created_at", "asc")) throw new ListQueryError("旧游标仅能用于默认查询");
@@ -3243,7 +3376,7 @@ function readExceptionPageQuery(
   };
 }
 
-function encodeExceptionCursor(cursor: FinancialExceptionCursor | null, providerAccountKey: string, query: ListQuery<ExceptionSort>): string | null {
+function encodeExceptionCursor(cursor: FinancialExceptionCursor | null, providerAccountKey: string | null, query: ListQuery<ExceptionSort>): string | null {
   return encodeListCursor("exceptions", [query, providerAccountKey], cursor ? cursor.position ?? {value: cursor.createdAt, keys: [cursor.exceptionId]} : null);
 }
 
@@ -3254,7 +3387,7 @@ function decodeExceptionCursor(
 ): FinancialExceptionCursor {
   const position = decodeListCursor(value, "exceptions", [query, expectedProviderAccountKey], "number");
   if (position) {
-    if (position.value === null || expectedProviderAccountKey === null || !ORDER_ID_PATTERN.test(position.keys[0]!)) throw new ListQueryError("分页游标无效");
+    if (position.value === null || !ORDER_ID_PATTERN.test(position.keys[0]!)) throw new ListQueryError("分页游标无效");
     return {createdAt: position.value as number, exceptionId: position.keys[0]!, position};
   }
   if (!isDefaultQuery(query, "created_at", "asc")) throw new ListQueryError("旧游标仅能用于默认查询");
@@ -3464,6 +3597,9 @@ function serializeAdminOrderSummary(order: AdminOrderSummaryProjection) {
   return {
     order_id: order.orderId,
     api_client_id: order.apiClientId,
+    alipay_account_id: order.alipayAccountId,
+    alipay_account_name: order.alipayAccountName,
+    provider_account_key: order.providerAccountKey,
     merchant_order_no: order.merchantOrderNo,
     requested_amount_cents: order.requestedAmountCents,
     payable_amount_cents: order.payableAmountCents,

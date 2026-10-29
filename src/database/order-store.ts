@@ -54,6 +54,7 @@ type DatabaseOwner = Pick<AppDatabase, "read" | "write">;
 
 export interface CollectionProfile {
   readonly profileId: string;
+  readonly alipayAccountId: string;
   readonly version: number;
   readonly providerAccountKey: string;
   readonly codePayload: string;
@@ -100,6 +101,9 @@ export interface StoredWebhookTarget {
 
 export interface SyncCollectionProfileInput {
   readonly providerAccountKey?: string;
+  readonly alipayAccountId?: string;
+  /** Account profiles are selected explicitly; the legacy singleton is only for old callers. */
+  readonly activate?: boolean;
   readonly codePayload: string;
   readonly payloadFingerprint: string;
   readonly profileFingerprint: string;
@@ -115,6 +119,7 @@ export interface SyncCollectionProfileResult {
 
 export interface CreateStoredOrderInput {
   readonly apiClientId: string;
+  readonly collectionProfileIds?: readonly string[];
   readonly siteRevision?: number;
   readonly request: CreateOrderRequest;
   readonly idempotencyKeyDigest: string;
@@ -199,6 +204,7 @@ export class OrderStore {
     return this.#database.write((connection) => {
       const now = this.#logicalNow(connection);
       const providerAccountKey = input.providerAccountKey ?? "primary";
+      const accountColumn = hasAccountColumn(connection);
       const expected = fingerprintCollectionCodeProfile(input.codePayload, providerAccountKey);
       if (
         input.payloadFingerprint !== expected.payloadFingerprint ||
@@ -228,12 +234,13 @@ export class OrderStore {
         const inserted = connection
           .prepare(
             `INSERT INTO collection_profiles(
-               profile_id, version, provider_account_key, code_payload,
+               profile_id, ${accountColumn ? "alipay_account_id," : ""} version, provider_account_key, code_payload,
                payload_fingerprint, profile_fingerprint, evidence_policy, created_at
-             ) VALUES (?, ?, 'primary', ?, ?, ?, 'UNIQUE_AMOUNT_AUTO', ?)`,
+             ) VALUES (?, ${accountColumn ? "?," : ""} ?, 'primary', ?, ?, ?, 'UNIQUE_AMOUNT_AUTO', ?)`,
           )
           .run(
             profileId,
+            ...(accountColumn ? [input.alipayAccountId ?? "default"] : []),
             version,
             input.codePayload,
             input.payloadFingerprint,
@@ -248,6 +255,12 @@ export class OrderStore {
       }
       if (profile.providerAccountKey !== providerAccountKey) {
         throw new Error("collection profile belongs to another provider account generation");
+      }
+      if (input.alipayAccountId !== undefined && profile.alipayAccountId !== input.alipayAccountId) {
+        throw new Error("collection profile belongs to another Alipay account");
+      }
+      if (input.activate === false) {
+        return { profile, changed: created, created, previousProfileId: null, activatedAt: now };
       }
 
       const activationTime = Math.max(now, active?.createdAt ?? 0);
@@ -328,6 +341,7 @@ export class OrderStore {
     return this.#database.write((connection) => {
       const now = this.#logicalNow(connection);
       expireDueOrders(connection, now, EXPIRY_SWEEP_LIMIT);
+      const accountColumn = hasAccountColumn(connection);
 
       let idempotent = readAggregateByIdempotencyDigest(
         connection,
@@ -445,22 +459,22 @@ export class OrderStore {
         return { kind: "amount_too_small" };
       }
 
-      const profile = readActiveCollectionProfile(connection);
-      if (!profile) throw new Error("collection profile is not initialized");
-
-      const allocation = allocateAmountSlot(
-        connection,
-        input.request.amount_cents,
-        input.amountOffsetMaximumCents,
-        now,
-        input.amountOffsetDirection ?? "UP",
-      );
-      if (allocation.kind === "exhausted") {
-        return {
-          kind: "amount_slots_exhausted",
-          retryAfterSeconds: allocation.retryAfterSeconds,
-        };
+      const profiles = input.collectionProfileIds === undefined
+        ? [readActiveCollectionProfile(connection)]
+        : input.collectionProfileIds.map(id => readCollectionProfileById(connection, id));
+      if (profiles.length === 0 || profiles.some(profile => !profile)) {
+        throw new Error("collection profile is not initialized");
       }
+      let selected: { profile: CollectionProfile; allocation: Extract<AmountAllocationResult, { kind: "allocated" }> } | undefined;
+      let retryAfterSeconds = Number.POSITIVE_INFINITY;
+      for (const profile of profiles) {
+        const allocation = allocateAmountSlot(connection, profile!.alipayAccountId,
+          input.request.amount_cents, input.amountOffsetMaximumCents, now, input.amountOffsetDirection ?? "UP");
+        if (allocation.kind === "allocated") { selected = { profile: profile!, allocation }; break; }
+        retryAfterSeconds = Math.min(retryAfterSeconds, allocation.retryAfterSeconds);
+      }
+      if (!selected) return { kind: "amount_slots_exhausted", retryAfterSeconds };
+      const { profile, allocation } = selected;
 
       const expiresAt = now + input.ttlMilliseconds;
       if (!Number.isSafeInteger(expiresAt) || expiresAt <= now ||
@@ -483,7 +497,7 @@ export class OrderStore {
       const orderInsert = connection
         .prepare(
           `INSERT INTO payment_orders(
-             order_id, api_client_id, merchant_order_no, idempotency_key_digest,
+             order_id, api_client_id, ${accountColumn ? "alipay_account_id," : ""} merchant_order_no, idempotency_key_digest,
              idempotency_key_digest_version,
              request_fingerprint, request_fingerprint_version,
              webhook_target_request_fingerprint,
@@ -495,13 +509,14 @@ export class OrderStore {
              refund_status, payment_basis, eligible_from, created_at, expires_at,
              closed_at, updated_at, version
            ) VALUES (
-             ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'CNY',
+             ?, ?, ${accountColumn ? "?," : ""} ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'CNY',
              ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', 'UNPAID', 'NONE', 'NONE', ?, ?, ?, NULL, ?, 1
            )`,
         )
         .run(
           orderId,
           input.apiClientId,
+          ...(accountColumn ? [profile.alipayAccountId] : []),
           input.request.merchant_order_no,
           input.idempotencyKeyDigest,
           IDEMPOTENCY_KEY_DIGEST_VERSION,
@@ -570,13 +585,14 @@ export class OrderStore {
       const slotInsert = connection
         .prepare(
           `INSERT INTO amount_slots(
-             slot_id, order_id, collection_profile_id, payable_amount_cents,
+             slot_id, order_id, ${accountColumn ? "alipay_account_id," : ""} collection_profile_id, payable_amount_cents,
              generation, occupied_from, released_at, release_reason
-           ) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL)`,
+           ) VALUES (?, ?, ${accountColumn ? "?," : ""} ?, ?, ?, ?, NULL, NULL)`,
         )
         .run(
           slotId,
           orderId,
+          ...(accountColumn ? [profile.alipayAccountId] : []),
           profile.profileId,
           allocation.payableAmountCents,
           allocation.generation,
@@ -639,13 +655,14 @@ export class OrderStore {
     return this.#database.write((connection) => {
       const now = this.#logicalNow(connection);
       expireDueOrders(connection, now, EXPIRY_SWEEP_LIMIT);
-      if (filters.apiClientId !== undefined || !isDefaultQuery(query, "created_at", "desc")) {
+      if (filters.apiClientId !== undefined || filters.alipayAccountId !== undefined || !isDefaultQuery(query, "created_at", "desc")) {
         const search = listSearch(["orders.order_id", "orders.merchant_order_no", "orders.product_name"], query.q);
         const seek = listKeyset("orders." + query.sortBy, ["orders.order_id"], query.sortOrder, cursor?.position, query.sortBy === "received_amount_cents");
         const dates = listCreatedDates("orders.created_at", query.createdFrom, query.createdTo);
         const where = [search.where, seek.where, dates.where].filter(Boolean);
         const parameters: Array<string | number> = [...search.parameters, ...seek.parameters, ...dates.parameters];
         if (filters.apiClientId !== undefined) { where.push("orders.api_client_id = ?"); parameters.push(filters.apiClientId); }
+        if (filters.alipayAccountId !== undefined) { where.push("orders.alipay_account_id = ?"); parameters.push(filters.alipayAccountId); }
         if (filters.paymentStatus !== null) { where.push("orders.payment_status = ?"); parameters.push(filters.paymentStatus); }
         if (filters.checkoutStatus === "EXPIRED") {
           where.push("(orders.checkout_status = 'EXPIRED' OR (orders.checkout_status = 'OPEN' AND orders.expires_at <= ?))"); parameters.push(now);
@@ -653,7 +670,7 @@ export class OrderStore {
           where.push("orders.checkout_status = 'OPEN' AND orders.expires_at > ?"); parameters.push(now);
         } else if (filters.checkoutStatus === "CLOSED") where.push("orders.checkout_status = 'CLOSED'");
         const statement = connection.prepare(
-          `${AGGREGATE_SELECT} ${where.length ? "WHERE " + where.join(" AND ") : ""} ORDER BY ${seek.orderBy} LIMIT ?`
+          `${aggregateSelect(connection)} ${where.length ? "WHERE " + where.join(" AND ") : ""} ORDER BY ${seek.orderBy} LIMIT ?`
         );
         const readRows = () => statement.all(...parameters, limit + 1) as unknown as AggregateRow[];
         let rows = readRows();
@@ -713,7 +730,7 @@ export class OrderStore {
         parameters.push(cursor.createdAt, cursor.orderId);
       }
       const statement = connection.prepare(
-        `${AGGREGATE_SELECT}
+        `${aggregateSelect(connection)}
          ${where.length > 0 ? `WHERE ${where.join(" AND ")}` : ""}
          ORDER BY orders.created_at DESC, orders.order_id DESC
          LIMIT ?`,
@@ -913,11 +930,13 @@ type AmountAllocationResult =
 
 function allocateAmountSlot(
   connection: DatabaseSync,
+  alipayAccountId: string,
   requestedAmountCents: number,
   maximumOffsetCents: number,
   now: number,
   direction: AmountOffsetDirection,
 ): AmountAllocationResult {
+  const accountColumn = hasAccountColumn(connection);
   let earliestAvailableAt: number | undefined;
   for (let offset = 1; offset <= maximumOffsetCents; offset += 1) {
     const payableAmountCents = requestedAmountCents + (direction === "DOWN" ? -offset : offset);
@@ -926,8 +945,8 @@ function allocateAmountSlot(
     const open = connection.prepare(
       `SELECT order_id, expires_at, amount_reuse_cooldown_seconds
          FROM payment_orders
-        WHERE payable_amount_cents = ? AND checkout_status = 'OPEN'`,
-    ).get(payableAmountCents) as {
+        WHERE ${accountColumn ? "alipay_account_id = ? AND" : ""} payable_amount_cents = ? AND checkout_status = 'OPEN'`,
+    ).get(...(accountColumn ? [alipayAccountId] : []), payableAmountCents) as {
       order_id: string;
       expires_at: bigint | number;
       amount_reuse_cooldown_seconds: bigint | number;
@@ -949,10 +968,10 @@ function allocateAmountSlot(
               orders.closed_at, orders.expires_at, orders.amount_reuse_cooldown_seconds
          FROM amount_slots AS slot
          JOIN payment_orders AS orders ON orders.order_id = slot.order_id
-        WHERE slot.payable_amount_cents = ?
+        WHERE ${accountColumn ? "slot.alipay_account_id = ? AND" : ""} slot.payable_amount_cents = ?
         ORDER BY slot.generation DESC
         LIMIT 1`,
-    ).get(payableAmountCents) as {
+    ).get(...(accountColumn ? [alipayAccountId] : []), payableAmountCents) as {
       generation: bigint | number;
       released_at: bigint | number | null;
       checkout_status: CheckoutStatus;
@@ -1105,6 +1124,7 @@ function insertOrderEvent(
 type AggregateRow = {
   order_id: string;
   api_client_id: string;
+  alipay_account_id: string;
   merchant_order_no: string;
   idempotency_key_digest: string;
   idempotency_key_digest_version: bigint | number;
@@ -1160,6 +1180,7 @@ const AGGREGATE_SELECT = `
   SELECT
     orders.order_id,
     orders.api_client_id,
+    orders.alipay_account_id,
     orders.merchant_order_no,
     orders.idempotency_key_digest,
     orders.idempotency_key_digest_version,
@@ -1228,6 +1249,15 @@ const ADMIN_ORDER_CHECKOUT_PAYMENT_SELECT = AGGREGATE_SELECT.replace(
   "FROM payment_orders AS orders INDEXED BY payment_orders_checkout_payment_created_idx",
 );
 
+function hasAccountColumn(connection: DatabaseSync): boolean {
+  return (connection.prepare("PRAGMA table_info(collection_profiles)").all() as { name: string }[])
+    .some(column => column.name === "alipay_account_id");
+}
+
+function aggregateSelect(connection: DatabaseSync, select = AGGREGATE_SELECT): string {
+  return hasAccountColumn(connection) ? select : select.replace("orders.alipay_account_id,", "'default' AS alipay_account_id,");
+}
+
 function readExpiredAdminOrderRows(
   connection: DatabaseSync,
   paymentStatus: PaymentStatus | null,
@@ -1276,12 +1306,12 @@ function readAdminOrderCheckoutBranch(
     where.push("(orders.created_at, orders.order_id) < (?, ?)");
     parameters.push(cursor.createdAt, cursor.orderId);
   }
-  const aggregateSelect = paymentStatus === null
+  const select = paymentStatus === null
     ? ADMIN_ORDER_CHECKOUT_SELECT
     : ADMIN_ORDER_CHECKOUT_PAYMENT_SELECT;
   return connection
     .prepare(
-      `${aggregateSelect}
+      `${aggregateSelect(connection, select)}
        WHERE ${where.join(" AND ")}
        ORDER BY orders.created_at DESC, orders.order_id DESC
        LIMIT ?`,
@@ -1347,7 +1377,7 @@ function readAggregateById(
   orderId: string,
 ): Omit<StoredOrderAggregate, "checkoutToken"> | undefined {
   const row = connection
-    .prepare(`${AGGREGATE_SELECT} WHERE orders.api_client_id = ? AND orders.order_id = ?`)
+    .prepare(`${aggregateSelect(connection)} WHERE orders.api_client_id = ? AND orders.order_id = ?`)
     .get(apiClientId, orderId) as AggregateRow | undefined;
   return row ? mapAggregate(row) : undefined;
 }
@@ -1357,7 +1387,7 @@ function readAggregateByAdminId(
   orderId: string,
 ): Omit<StoredOrderAggregate, "checkoutToken"> | undefined {
   const row = connection
-    .prepare(`${AGGREGATE_SELECT} WHERE orders.order_id = ?`)
+    .prepare(`${aggregateSelect(connection)} WHERE orders.order_id = ?`)
     .get(orderId) as AggregateRow | undefined;
   return row ? mapAggregate(row) : undefined;
 }
@@ -1369,7 +1399,7 @@ function readAggregateByMerchantOrderNumber(
 ): Omit<StoredOrderAggregate, "checkoutToken"> | undefined {
   const row = connection
     .prepare(
-      `${AGGREGATE_SELECT}
+      `${aggregateSelect(connection)}
        WHERE orders.api_client_id = ? AND orders.merchant_order_no = ?`,
     )
     .get(apiClientId, merchantOrderNo) as AggregateRow | undefined;
@@ -1383,7 +1413,7 @@ function readAggregateByIdempotencyDigest(
 ): Omit<StoredOrderAggregate, "checkoutToken"> | undefined {
   const row = connection
     .prepare(
-      `${AGGREGATE_SELECT}
+      `${aggregateSelect(connection)}
        WHERE orders.api_client_id = ? AND orders.idempotency_key_digest = ?`,
     )
     .get(apiClientId, digest) as AggregateRow | undefined;
@@ -1417,7 +1447,7 @@ function readAggregateByTokenDigest(
   digest: string,
 ): Omit<StoredOrderAggregate, "checkoutToken"> | undefined {
   const row = connection
-    .prepare(`${AGGREGATE_SELECT} WHERE checkout.token_digest = ?`)
+    .prepare(`${aggregateSelect(connection)} WHERE checkout.token_digest = ?`)
     .get(digest) as AggregateRow | undefined;
   return row ? mapAggregate(row) : undefined;
 }
@@ -1460,6 +1490,8 @@ function mapAggregate(row: AggregateRow): Omit<StoredOrderAggregate, "checkoutTo
   const order: PaymentOrder = {
     orderId: row.order_id,
     apiClientId: row.api_client_id,
+    alipayAccountId: row.alipay_account_id,
+    providerAccountKey: row.provider_account_key,
     merchantOrderNo: row.merchant_order_no,
     idempotencyKeyDigest: row.idempotency_key_digest,
     idempotencyKeyDigestVersion: IDEMPOTENCY_KEY_DIGEST_VERSION,
@@ -1505,6 +1537,7 @@ function mapAggregate(row: AggregateRow): Omit<StoredOrderAggregate, "checkoutTo
     },
     collectionProfile: {
       profileId: row.collection_profile_id,
+      alipayAccountId: row.alipay_account_id,
       version: toSafeInteger(row.profile_version, "collection profile version"),
       providerAccountKey: row.provider_account_key,
       codePayload: row.code_payload,
@@ -1825,7 +1858,7 @@ function assertPositiveSafeInteger(value: number, label: string): void {
 function readActiveCollectionProfile(connection: DatabaseSync): CollectionProfile | undefined {
   const row = connection
     .prepare(
-      `SELECT profile.profile_id, profile.version,
+      `SELECT profile.profile_id, ${hasAccountColumn(connection) ? "profile.alipay_account_id" : "'default' AS alipay_account_id"}, profile.version,
               COALESCE(link.provider_account_key, profile.provider_account_key)
                 AS provider_account_key,
               profile.code_payload, profile.payload_fingerprint,
@@ -1846,7 +1879,7 @@ function readCollectionProfileByFingerprint(
 ): CollectionProfile | undefined {
   const row = connection
     .prepare(
-      `SELECT profile.profile_id, profile.version,
+      `SELECT profile.profile_id, ${hasAccountColumn(connection) ? "profile.alipay_account_id" : "'default' AS alipay_account_id"}, profile.version,
               COALESCE(link.provider_account_key, profile.provider_account_key)
                 AS provider_account_key,
               profile.code_payload, profile.payload_fingerprint,
@@ -1866,7 +1899,7 @@ function readCollectionProfileById(
 ): CollectionProfile | undefined {
   const row = connection
     .prepare(
-      `SELECT profile.profile_id, profile.version,
+      `SELECT profile.profile_id, ${hasAccountColumn(connection) ? "profile.alipay_account_id" : "'default' AS alipay_account_id"}, profile.version,
               COALESCE(link.provider_account_key, profile.provider_account_key)
                 AS provider_account_key,
               profile.code_payload, profile.payload_fingerprint,
@@ -1882,6 +1915,7 @@ function readCollectionProfileById(
 
 interface CollectionProfileRow {
   readonly profile_id: string;
+  readonly alipay_account_id: string;
   readonly version: bigint | number;
   readonly provider_account_key: string;
   readonly code_payload: string;
@@ -1901,6 +1935,7 @@ function mapCollectionProfile(row: CollectionProfileRow): CollectionProfile {
   }
   return {
     profileId: row.profile_id,
+    alipayAccountId: row.alipay_account_id,
     version: toSafeInteger(row.version, "collection profile version"),
     providerAccountKey: row.provider_account_key,
     codePayload: row.code_payload,
