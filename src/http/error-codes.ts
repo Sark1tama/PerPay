@@ -1,5 +1,14 @@
 /** Every code that can be returned in the public HTTP error envelope. */
 export const HTTP_ERROR_CODES = Object.freeze([
+  "alipay_account_not_found",
+  "alipay_accounts_unavailable",
+  "alipay_account_revision_conflict",
+  "alipay_account_in_use",
+  "alipay_account_app_conflict",
+  "alipay_account_not_configured",
+  "alipay_settings_moved",
+  "site_collection_required",
+  "site_collection_invalid",
   "admin_ip_not_allowed",
   "admin_operation_conflict",
   "refund_mark_version_conflict",
@@ -39,6 +48,7 @@ export const HTTP_ERROR_CODES = Object.freeze([
   "ledger_conflict_state_conflict",
   "ledger_entry_not_found",
   "ledger_unavailable",
+  "ledger_scan_unavailable",
   "match_not_found",
   "match_state_conflict",
   "merchant_order_no_conflict",

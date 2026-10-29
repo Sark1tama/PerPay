@@ -6,6 +6,7 @@ import { existsSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
+import { parseArgs } from "node:util";
 import { serve } from "@hono/node-server";
 import { Hono } from "hono";
 
@@ -22,7 +23,7 @@ import { assessWebhookAck } from "../src/notifications/model.ts";
 import { createApp } from "../src/http/app.ts";
 import { systemAnalytics } from "../src/http/system-analytics.ts";
 import { renderCollectionCodeSvg } from "../src/http/web/collection-code.ts";
-import { UpdateCheckUnavailable } from "../src/update/checker.ts";
+import { OfficialUpdateChecker, UpdateCheckUnavailable } from "../src/update/checker.ts";
 import type { SiteSnapshot } from "../src/sites/model.ts";
 import { seedFinancialScenarios } from "./preview-financial-scenarios.ts";
 import { seedNotificationScenarios } from "./preview-notification-scenarios.ts";
@@ -50,7 +51,7 @@ const sample = (day: number, key: string) => createHash("sha256").update("perpay
   .digest().readUInt32BE(0) / 0x1_0000_0000;
 const beijing = (time: number) => new Date(time + 8 * 3_600_000).toISOString().slice(0, 19).replace("T", " ");
 
-export async function createPreviewDemo(options: { port?: number; now?: number; clock?: () => number } = {}) {
+export async function createPreviewDemo(options: { port?: number; now?: number; clock?: () => number; updateChecker?: Pick<OfficialUpdateChecker, "check"> } = {}) {
   const port = options.port ?? 6192;
   if (!Number.isInteger(port) || port < 1024 || port > 65535) throw new Error("演示端口必须在 1024–65535 之间。");
   const capturedAt = options.now ?? Date.now();
@@ -78,7 +79,7 @@ export async function createPreviewDemo(options: { port?: number; now?: number; 
       PERPAY_BACKUP_DIR: join(directory, "backups"),
       PERPAY_PUBLIC_URL: origin,
     });
-    const db = await AppDatabase.open(config.databasePath);
+    const db = await AppDatabase.open(config.databasePath, { masterKey: config.masterKey });
     database = db;
     let liveStarted: number | null = null;
     const liveNow = () => options.clock?.() ?? capturedAt + (liveStarted === null ? 0 : Math.floor(performance.now() - liveStarted));
@@ -95,17 +96,17 @@ export async function createPreviewDemo(options: { port?: number; now?: number; 
     const audit = { actorId: "admin", requestId: "documentation-fixture", remoteAddressHash: "0".repeat(64) };
     const application = generateKeyPairSync("rsa", { modulusLength: 2048 });
     const platform = generateKeyPairSync("rsa", { modulusLength: 2048 });
-    await settings.saveCollectionCode({
-      revision: settings.instanceView().revision,
+    const accounts = settings.accountService()!;
+    const account = await accounts.create({
+      name: "演示收款账号", enabled: true,
       code_payload: "https://qr.alipay.com/perpay-documentation-no-real-payment",
-    }, audit);
-    await settings.saveProvider({
-      revision: settings.instanceView().revision, environment: "SANDBOX", app_id: "2026000000000001",
+      environment: "SANDBOX", app_id: "2026000000000001",
       private_key: application.privateKey.export({ format: "pem", type: "pkcs8" }).toString(),
       platform_public_key: platform.publicKey.export({ format: "pem", type: "spki" }).toString(),
-      timeout_milliseconds: 8000, scan_interval_seconds: 60, active_scan_interval_seconds: 8,
-      safety_lag_seconds: 10, maximum_success_age_seconds: 120,
     }, audit);
+    // These two sources deliberately represent one account before and after an
+    // application change, so its duplicate-source examples keep one identity.
+    db.write(connection => connection.prepare("INSERT INTO alipay_account_generations (provider_account_key,account_id,created_at) VALUES (?,?,?)").run("preview-historical", account.id, capturedAt - 27 * DAY));
     const midnight = Math.floor((capturedAt + 8 * 3_600_000) / DAY) * DAY - 8 * 3_600_000;
     let now = midnight - (HISTORY_DAYS - 1) * DAY;
     // Rebase only the empty, newly migrated order clock before creating any financial facts.
@@ -125,6 +126,7 @@ export async function createPreviewDemo(options: { port?: number; now?: number; 
       const policy = sites.defaults().policy;
       const site = sites.create({ operation_id: randomUUID(), configuration: {
         name, accepting_orders: options.acceptingOrders ?? true, notifications_enabled: false,
+        collection: { mode: "FIXED", accounts: [{ account_id: account.id, weight: 1 }] },
         notification_origin: options.origin === undefined ? "https://shop.example.com" : options.origin,
         return_origin: options.origin === undefined ? "https://shop.example.com" : options.origin,
         policy: { ...policy, orders: { ...policy.orders, order_ttl_seconds: 1800,
@@ -145,13 +147,12 @@ export async function createPreviewDemo(options: { port?: number; now?: number; 
     const unconfiguredSite = createSite("橙页创意商店", { credentials: false, acceptingOrders: false, origin: null });
     const noNotificationSite = createSite("松果知识铺", { notifications: false, origin: null });
     const limitedSite = createSite("白帆数码商城", { pendingOrderLimit: 2 });
-    const orders = new OrderService(db, () => settings.instanceSnapshot(), () => liveStarted === null ? now : liveNow(), sites);
+    const orders = new OrderService(db, () => settings.instanceSnapshot(), () => liveStarted === null ? now : liveNow(), sites, undefined, { accounts: () => accounts.store().snapshots(), available: () => true });
     orders.initialize();
     const reconciliation = new ReconciliationStore(db);
     const webhooks = new WebhookStore(db);
-    const snapshot = settings.instanceSnapshot();
-    assert.ok(snapshot.activeProviderAccountKey);
-    const providerAccountKey = snapshot.activeProviderAccountKey;
+    assert.ok(account.provider_account_key);
+    const providerAccountKey = account.provider_account_key;
     let sequence = 0;
     let ledgerSequence = 0;
     function credit(cents: number, product: string) {
@@ -390,11 +391,16 @@ export async function createPreviewDemo(options: { port?: number; now?: number; 
     const app = createApp({
       config, database: db, identity, settings, sites, orders, ledger, reconciliation, webhookStore: webhooks,
       startedAt: new Date(capturedAt - 8 * DAY), clock: liveNow, demoMode: true,
+      runtimeStatus: () => ({ configured: true, transitioning: false,
+        paymentRevision: settings.instanceSnapshot().paymentRevision, activeProviderAccountKey: providerAccountKey,
+        scanIntervalMilliseconds: 60_000, maximumSuccessAgeMilliseconds: 120_000 }),
       ledgerHealth: healthy,
+      accountHealth: () => ({ state: "healthy", lastSuccessAt: liveNow() - 2000, lastErrorCode: null, collectionReady: true }),
       reconciliationHealth: () => ({ ...healthy(), pendingOrders: systemAnalytics(db, 7, liveNow()).pending.orders, continuationPending: false }),
       webhookHealth: () => ({ ...healthy(), pendingDeliveries: webhooks.counts().pending, deadLetters: webhooks.counts().dead }),
-      // Never claim a real update check has succeeded and never contact GitHub.
-      updateChecker: { check: async () => { throw new UpdateCheckUnavailable(3600); } },
+      // Default fixtures stay offline. Interactive previews can explicitly supply
+      // the official metadata checker without starting any payment transports.
+      updateChecker: options.updateChecker ?? { check: async () => { throw new UpdateCheckUnavailable(3600); } },
     });
     const preview = new Hono();
     preview.use("*", async (context, next) => {
@@ -402,7 +408,7 @@ export async function createPreviewDemo(options: { port?: number; now?: number; 
       const sessionAction = context.req.method === "POST" && ["/api/admin/v1/session/login", "/api/admin/v1/session/logout"].includes(context.req.path);
       const exportRead = context.req.method === "POST" && /^\/api\/admin\/v1\/(?:sites\/[^/]+\/)?orders\/export$/.test(context.req.path);
       if (!["GET", "HEAD"].includes(context.req.method) && !sessionAction && !exportRead) {
-        return context.json({ error: { code: "demo_read_only", message: "这是只读演示，不执行付款、设置或财务操作。" } }, 403);
+        return context.json({ error: { code: "demo_read_only", message: "当前操作不可用。" } }, 403);
       }
       await next();
     });
@@ -425,14 +431,16 @@ export async function createPreviewDemo(options: { port?: number; now?: number; 
 }
 
 async function main() {
-  const args = process.argv.slice(2);
-  if (args.length > 0 && (args.length !== 2 || args[0] !== "--port")) throw new Error("用法：npm run demo:preview -- [--port 6192]");
+  const { values } = parseArgs({ options: { port: { type: "string" }, "official-updates": { type: "boolean", default: false } } });
   for (const path of ["web-dist/admin/index.html", "web-dist/checkout/.vite/manifest.json"]) {
     if (!existsSync(resolve(path))) throw new Error("请先在仓库根目录执行 npm run build。");
   }
-  const demo = await createPreviewDemo(args.length ? { port: Number(args[1]) } : {});
+  const demo = await createPreviewDemo({
+    ...(values.port === undefined ? {} : { port: Number(values.port) }),
+    ...(values["official-updates"] ? { updateChecker: new OfficialUpdateChecker() } : {}),
+  });
   const server = serve({ fetch: demo.app.fetch, hostname: "127.0.0.1", port: Number(new URL(demo.origin).port) }, () => {
-    console.log("\nPerPay 只读演示 · 全部为合成数据 · 不向外部服务发请求");
+    console.log("\nPerPay 本地预览 · 官方更新查询" + (values["official-updates"] ? "已启用" : "未启用"));
     console.log(JSON.stringify({ origin: demo.origin, password: demo.password, capturedAt: demo.capturedAt, featured: demo.featured, retry: demo.retry, failed: demo.failed, checkout: demo.checkout, checkoutExpiresAt: new Date(demo.capturedAt + 22 * MINUTE).toISOString(), orders: demo.stats.orders, daily: demo.stats.daily, directory: demo.directory, scenarios: demo.scenarios }, null, 2));
     console.log("\n访问 " + demo.origin + "/admin/，按 Ctrl+C 退出并清理临时数据。");
   });

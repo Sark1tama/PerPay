@@ -81,7 +81,7 @@ client.interceptors.request.use((request) => {
   if (!["GET", "HEAD", "OPTIONS"].includes(request.method)) {
     const path = new URL(request.url).pathname;
     if (isReadOnlyDemo() && !["/api/admin/v1/session/login", "/api/admin/v1/session/logout", "/api/admin/v1/orders/export"].includes(path)) {
-      throw new ApiError(undefined, {error:{code:"demo_read_only",message:"只读演示：保存、密钥及财务操作不可用。"}});
+      throw new ApiError(undefined, {error:{code:"demo_read_only",message:"当前操作不可用。"}});
     }
     const token = readCsrfToken();
     if (token) request.headers.set("X-CSRF-Token", token);
@@ -138,8 +138,8 @@ export const queryClient = new QueryClient({
   },
 });
 
-export async function refreshOperationalData(): Promise<void> {
-  await queryClient.invalidateQueries({ predicate: (query) => !["session", "settings", "official-update"].includes(String(query.queryKey[0])) });
+export async function refreshOperationalData({ includeStatus = true }: { includeStatus?: boolean } = {}): Promise<void> {
+  await queryClient.invalidateQueries({ predicate: (query) => !["session", "settings", "official-update", ...(!includeStatus ? ["status"] : [])].includes(String(query.queryKey[0])) });
 }
 
 // Retain public branding across logout while reacting to saved/refreshed settings.

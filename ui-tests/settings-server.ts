@@ -4,16 +4,22 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
-import { createApp } from "../src/http/app";
+import { createApp, type AppDependencies } from "../src/http/app";
 import { LedgerStore } from "../src/ledger/store";
 import { createOrderRequestSchema } from "../src/orders/model";
 import { ReconciliationStore } from "../src/reconciliation/store";
-import { UpdateCheckUnavailable } from "../src/update/checker";
+import { UpdateCheckUnavailable, type OfficialUpdateChecker } from "../src/update/checker";
 import { createConfiguredHttpServices, HTTP_TEST_ADMIN_PASSWORD } from "../test/http-fixture";
 import { recordLedgerEntry } from "../test/reconciliation-http-fixture";
 
 /** Writable temporary SQLite fixture; no provider or notification transport runs. */
-export async function createSettingsServer(epoch: number) {
+export async function createSettingsServer(epoch: number, options: {
+  updateChecker?: Pick<OfficialUpdateChecker, "check">;
+  demoMode?: boolean;
+  clock?: () => number;
+  runtime?: (services: Awaited<ReturnType<typeof createConfiguredHttpServices>>) => Partial<Pick<AppDependencies,
+    "runtimeStatus" | "ledgerHealth" | "ledgerNextRunAt" | "ledgerManualScan" | "requestLedgerScan" | "alipayAccounts" | "accountHealth" | "reconciliationHealth" | "orders">>;
+} = {}) {
   const probe = createServer();
   probe.listen(0, "127.0.0.1");
   await once(probe, "listening");
@@ -24,8 +30,9 @@ export async function createSettingsServer(epoch: number) {
   const directory = mkdtempSync(join(tmpdir(), "perpay-settings-browser-"));
   const services = await createConfiguredHttpServices({ directory, publicUrl: origin,
     apiSecret: null, collectionCodePayload: "https://qr.alipay.com/isolated-settings-fixture", identityClock: () => epoch });
-  const app = createApp({ ...services, clock: () => epoch, startedAt: new Date(epoch),
-    updateChecker: { check: async () => { throw new UpdateCheckUnavailable(3600); } },
+  const app = createApp({ ...services, ...options.runtime?.(services), clock: options.clock ?? (() => epoch), startedAt: new Date(epoch),
+    updateChecker: options.updateChecker ?? { check: async () => { throw new UpdateCheckUnavailable(3600); } },
+    demoMode: options.demoMode ?? false,
   });
   const server = serve({ fetch: app.fetch, hostname: "127.0.0.1", port: address.port });
   await once(server, "listening");

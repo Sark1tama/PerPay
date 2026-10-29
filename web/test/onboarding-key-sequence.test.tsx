@@ -95,7 +95,7 @@ describe("sequential application-key onboarding", () => {
     expect(submit.form).toBe(form);
     expect(view.writes()).toHaveLength(0);
     await fillAndSubmit(user, " latest-alipay-key ");
-    await screen.findByLabelText("支付宝经营码内容");
+    await screen.findByLabelText("支付宝收款码内容");
     expect(view.router.state.location.pathname).toBe(collectionPath);
     expect(screen.getByText("应用公钥已验证并启用。")).toBeVisible();
     expect(await body(view)).toEqual({
@@ -138,7 +138,7 @@ describe("sequential application-key onboarding", () => {
       expect(view.router.state.location.pathname).toBe(
         "/settings/onboarding/" + expected,
       );
-      expect(screen.getByRole("link", { name: /经营码/ })).not.toHaveAttribute(
+      expect(screen.getByRole("link", { name: /收款码/ })).not.toHaveAttribute(
         "aria-disabled",
         "true",
       );
@@ -150,7 +150,7 @@ describe("sequential application-key onboarding", () => {
       }
       expect(
         within(
-          screen.getByRole("link", { name: /支付宝接入/ }),
+          screen.getByRole("link", { name: /支付宝账号/ }),
         ).queryByLabelText("已配置"),
       ).not.toBeInTheDocument();
       expect(view.writes()).toHaveLength(0);
@@ -224,7 +224,7 @@ describe("sequential application-key onboarding", () => {
     await user.clear(input);
     await user.type(input, "corrected-alipay-key");
     await user.click(within(form).getByRole("button", { name: actionLabel }));
-    await screen.findByLabelText("支付宝经营码内容");
+    await screen.findByLabelText("支付宝收款码内容");
     expect(await body(view, 1)).toEqual(await body(view, 0));
     expect(await body(view, 2)).toEqual({
       ...(await body(view, 0)),
@@ -359,7 +359,7 @@ describe("sequential application-key onboarding", () => {
     await user.click(
       within(form).getByRole("button", { name: "重试上一次操作" }),
     );
-    await screen.findByLabelText("支付宝经营码内容");
+    await screen.findByLabelText("支付宝收款码内容");
     expect(await body(view, 1)).toEqual(await body(view, 0));
   });
 
@@ -390,7 +390,7 @@ describe("sequential application-key onboarding", () => {
     await act(async () => {
       finish(json({ data: activatedSettings() }));
     });
-    await screen.findByLabelText("支付宝经营码内容");
+    await screen.findByLabelText("支付宝收款码内容");
     expect(view.writes()).toHaveLength(1);
   });
 

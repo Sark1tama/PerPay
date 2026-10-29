@@ -5,6 +5,12 @@ import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { describe, it } from "node:test";
 import { AppDatabase } from "../src/database/database.ts";
+import { migrations, migrationChecksum } from "../src/database/migrations.ts";
+import { migrateSiteData } from "../src/sites/migrations/data.ts";
+import { RuntimeSettingsStore, RuntimeSettingsService } from "../src/settings/index.ts";
+import { OrderService } from "../src/orders/service.ts";
+import { AlipayAccountStore } from "../src/alipay-accounts/index.ts";
+import { DATABASE_COMPATIBILITY } from "../src/version.ts";
 import { createOrderRequestSchema, MAX_REQUESTED_AMOUNT_CENTS, type AmountOffsetDirection } from "../src/orders/model.ts";
 import { OrderError } from "../src/orders/service.ts";
 import { createApp } from "../src/http/app.ts";
@@ -205,6 +211,66 @@ it("serves downward orders through the signed API and restores their policy and 
   } finally { f.close(); }
 });
 
+it("upgrades fork schema 37 with one-cent orders while preserving amount policy, keys and checkout evidence", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "perpay-offset-upgrade-"));
+  const legacy = await createConfiguredLegacyHttpServices({ directory, apiSecret: null, collectionCodePayload: "https://qr.alipay.com/offset-fork-upgrade" });
+  let current: AppDatabase | undefined;
+  try {
+    // Apply the unchanged historical fork migrations to a real configured old database.
+    legacy.database.write(db => {
+      for (const migration of migrations.filter(item => item.version >= 34 && item.version <= 37)) {
+        db.exec(migration.sql);
+        if (migration.postApply === "migrate_websites_v1") migrateSiteData(db, legacy.config.masterKey);
+        db.prepare("INSERT INTO schema_migrations VALUES (?, ?, ?, ?)").run(migration.version, migration.name, migrationChecksum(migration), new Date().toISOString());
+      }
+    });
+    const settings = new RuntimeSettingsService({ store: new RuntimeSettingsStore(legacy.database, legacy.config.masterKey) });
+    settings.initialize();
+    const sites = new SiteStore(legacy.database, legacy.config.masterKey), site = sites.get("default")!;
+    site.configuration.policy.orders.amount_offset_direction = "DOWN";
+    sites.update(site.clientId, { revision: site.revision, configuration: site.configuration }, audit);
+    const oldOrders = new OrderService(legacy.database, () => settings.instanceSnapshot(), undefined, sites, site.clientId);
+    const original = request(2), first = oldOrders.create(original).order;
+    assert.equal(first.payableAmountCents, 1);
+    const closed = oldOrders.create(request()).order;
+    oldOrders.close(closed.orderId);
+    const tables = ["payment_orders", "amount_slots", "order_events", "checkout_sessions"];
+    const before = tables.map(table => legacy.database.read(db => db.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all()));
+    const policy = sites.get(site.clientId)!.configuration.policy;
+    const oldProvider = settings.instanceSnapshot().provider;
+    legacy.database.close();
+    current = await AppDatabase.open(legacy.config.databasePath, { masterKey: legacy.config.masterKey });
+    const after = tables.map(table => current!.read(db => db.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all()));
+    assert.deepEqual(after.map(rows => rows.map(({ alipay_account_id: _, ...row }) => row)), before.map(rows => rows.map(row => ({ ...row }))));
+    assert.equal(after[0]![0]!.alipay_account_id, "default");
+    const newStore = new RuntimeSettingsStore(current, legacy.config.masterKey);
+    newStore.initialize();
+    const accounts = new AlipayAccountStore(current, legacy.config.masterKey);
+    assert.deepEqual(accounts.snapshot("default").provider, oldProvider);
+    const newSites = newStore.siteStore()!;
+    assert.deepEqual(newSites.get(site.clientId)!.configuration.policy, policy);
+    const orders = new OrderService(current, () => newStore.instanceSnapshot(), undefined, newSites, site.clientId,
+      { accounts: () => accounts.snapshots() });
+    assert.equal(orders.create(original).order.orderId, first.orderId);
+    assert.equal(orders.publicCheckout(first.checkoutToken).paymentInstructions?.payableAmountCents, 1);
+    assert.equal(orders.create(request()).order.payableAmountCents, 98);
+    assert.equal(current.integrityCheck().ok, true);
+    const backup = join(directory, "fork38-backup.sqlite3");
+    await current.backup(backup);
+    const restored = await AppDatabase.open(backup, { masterKey: legacy.config.masterKey });
+    try {
+      new RuntimeSettingsStore(restored, legacy.config.masterKey).initialize();
+      assert.equal(restored.integrityCheck().ok, true);
+      assert.equal(restored.read(db => db.prepare("SELECT payable_amount_cents FROM payment_orders WHERE order_id = ?").get(first.orderId)!.payable_amount_cents), 1n);
+    } finally { restored.close(); }
+  } finally {
+    legacy.database.close(); current?.close();
+    assert.equal(dirname(resolve(directory)), resolve(tmpdir()));
+    assert.ok(basename(directory).startsWith("perpay-offset-upgrade-"));
+    rmSync(directory, { recursive: true });
+  }
+});
+
 it("upgrades existing open and closed orders without changing their financial snapshots or checkout tokens", async () => {
   const directory = mkdtempSync(join(tmpdir(), "perpay-offset-upgrade-"));
   const legacy = await createConfiguredLegacyHttpServices({ directory, apiSecret: null, collectionCodePayload: "https://qr.alipay.com/offset-upgrade" });
@@ -218,8 +284,9 @@ it("upgrades existing open and closed orders without changing their financial sn
     legacy.database.close();
     current = await AppDatabase.open(legacy.config.databasePath, { masterKey: legacy.config.masterKey });
     const after = tables.map(table => current!.read(db => db.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all()));
-    assert.deepEqual(after, before);
-    assert.equal(current.read(db => db.prepare("SELECT max(version) AS n FROM schema_migrations").get()!.n), 37n);
+    assert.deepEqual(after.map(rows => rows.map(({ alipay_account_id: _, ...row }) => row)), before.map(rows => rows.map(row => ({ ...row }))));
+    assert.equal(after[0]![0]!.alipay_account_id, "default");
+    assert.equal(current.read(db => db.prepare("SELECT max(version) AS n FROM schema_migrations").get()!.n), BigInt(DATABASE_COMPATIBILITY.maximum));
     assert.equal(current.integrityCheck().ok, true);
     const backup = join(directory, "backup.sqlite3");
     await current.backup(backup);

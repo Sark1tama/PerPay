@@ -50,12 +50,16 @@ export function CollectionCodeField({
   onDecoded,
   onPendingChange,
   disabled = false,
+  required = true,
+  onValueChange,
   error,
 }: {
   defaultValue: string;
   onDecoded: () => void;
   onPendingChange: (pending: boolean) => void;
   disabled?: boolean;
+  required?: boolean;
+  onValueChange?: (value: string) => void;
   error?: string | undefined;
 }) {
   const textarea = useRef<HTMLTextAreaElement>(null);
@@ -120,6 +124,7 @@ export function CollectionCodeField({
       const issue = collectionCodeError(payload);
       if (issue) throw new Error(issue);
       textarea.current.value = payload;
+      onValueChange?.(payload);
       onDecoded();
       setFeedback({ kind: "success" });
     } catch (error) {
@@ -206,7 +211,7 @@ export function CollectionCodeField({
               ? "正在识别…"
               : dragging
                 ? "松开即可识别"
-                : "经营码图片"}
+                : "收款码图片"}
           </EmptyTitle>
           <EmptyDescription id={uploadHintId}>
             PNG、JPG、WebP，最大 10 MB
@@ -219,7 +224,7 @@ export function CollectionCodeField({
             accept={qrImageAccept}
             hidden
             disabled={disabled}
-            aria-label="选择经营码二维码图片"
+            aria-label="选择收款码二维码图片"
             onChange={(event) => {
               void selectImage(event);
             }}
@@ -256,18 +261,18 @@ export function CollectionCodeField({
         </EmptyContent>
       </Empty>
       <Field data-invalid={!!error}>
-        <FieldLabel htmlFor={feedbackId + "-code"}>支付宝经营码内容</FieldLabel>
+        <FieldLabel htmlFor={feedbackId + "-code"}>支付宝收款码内容</FieldLabel>
         <Textarea
           ref={textarea}
           id={feedbackId + "-code"}
           name="code_payload"
           rows={2}
-          required
+          required={required}
           minLength={8}
           maxLength={2331}
           defaultValue={defaultValue}
           disabled={disabled}
-          onChange={cancelReading}
+          onChange={event => { cancelReading(); onValueChange?.(event.currentTarget.value); }}
           autoComplete="off"
           spellCheck={false}
           placeholder="https://qr.alipay.com/…"
