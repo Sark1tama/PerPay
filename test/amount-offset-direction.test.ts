@@ -7,6 +7,7 @@ import { describe, it } from "node:test";
 import { AppDatabase } from "../src/database/database.ts";
 import { migrations, migrationChecksum } from "../src/database/migrations.ts";
 import { migrateSiteData } from "../src/sites/migrations/data.ts";
+import { migrateAlipayAccounts } from "../src/alipay-accounts/migration.ts";
 import { RuntimeSettingsStore, RuntimeSettingsService } from "../src/settings/index.ts";
 import { OrderService } from "../src/orders/service.ts";
 import { AlipayAccountStore } from "../src/alipay-accounts/index.ts";
@@ -211,7 +212,8 @@ it("serves downward orders through the signed API and restores their policy and 
   } finally { f.close(); }
 });
 
-it("upgrades fork schema 37 with one-cent orders while preserving amount policy, keys and checkout evidence", async () => {
+for (const sourceSchema of [37, 38]) {
+it(`upgrades fork schema ${sourceSchema} with one-cent orders while preserving amount policy, keys and checkout evidence`, async () => {
   const directory = mkdtempSync(join(tmpdir(), "perpay-offset-upgrade-"));
   const legacy = await createConfiguredLegacyHttpServices({ directory, apiSecret: null, collectionCodePayload: "https://qr.alipay.com/offset-fork-upgrade" });
   let current: AppDatabase | undefined;
@@ -234,14 +236,20 @@ it("upgrades fork schema 37 with one-cent orders while preserving amount policy,
     assert.equal(first.payableAmountCents, 1);
     const closed = oldOrders.create(request()).order;
     oldOrders.close(closed.orderId);
-    const tables = ["payment_orders", "amount_slots", "order_events", "checkout_sessions"];
-    const before = tables.map(table => legacy.database.read(db => db.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all()));
     const policy = sites.get(site.clientId)!.configuration.policy;
     const oldProvider = settings.instanceSnapshot().provider;
+    if (sourceSchema === 38) legacy.database.write(db => {
+      const migration = migrations.find(item => item.version === 38)!;
+      db.exec(migration.sql);
+      migrateAlipayAccounts(db, legacy.config.masterKey);
+      db.prepare("INSERT INTO schema_migrations VALUES (?, ?, ?, ?)").run(migration.version, migration.name, migrationChecksum(migration), new Date().toISOString());
+    });
+    const tables = ["payment_orders", "amount_slots", "order_events", "checkout_sessions"];
+    const before = tables.map(table => legacy.database.read(db => db.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all()));
     legacy.database.close();
     current = await AppDatabase.open(legacy.config.databasePath, { masterKey: legacy.config.masterKey });
     const after = tables.map(table => current!.read(db => db.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all()));
-    assert.deepEqual(after.map(rows => rows.map(({ alipay_account_id: _, ...row }) => row)), before.map(rows => rows.map(row => ({ ...row }))));
+    assert.deepEqual(after.map(rows => rows.map(({ alipay_account_id: _, ...row }) => row)), before.map(rows => rows.map(({ alipay_account_id: _, ...row }) => row)));
     assert.equal(after[0]![0]!.alipay_account_id, "default");
     const newStore = new RuntimeSettingsStore(current, legacy.config.masterKey);
     newStore.initialize();
@@ -255,7 +263,7 @@ it("upgrades fork schema 37 with one-cent orders while preserving amount policy,
     assert.equal(orders.publicCheckout(first.checkoutToken).paymentInstructions?.payableAmountCents, 1);
     assert.equal(orders.create(request()).order.payableAmountCents, 98);
     assert.equal(current.integrityCheck().ok, true);
-    const backup = join(directory, "fork38-backup.sqlite3");
+    const backup = join(directory, "fork-upgraded-backup.sqlite3");
     await current.backup(backup);
     const restored = await AppDatabase.open(backup, { masterKey: legacy.config.masterKey });
     try {
@@ -270,6 +278,7 @@ it("upgrades fork schema 37 with one-cent orders while preserving amount policy,
     rmSync(directory, { recursive: true });
   }
 });
+}
 
 it("upgrades existing open and closed orders without changing their financial snapshots or checkout tokens", async () => {
   const directory = mkdtempSync(join(tmpdir(), "perpay-offset-upgrade-"));

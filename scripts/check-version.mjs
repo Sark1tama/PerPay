@@ -5,8 +5,8 @@ import { parse } from "yaml";
 import { inspectComposeContract } from "./compose-contract.mjs";
 import { isReleaseVersion } from "../src/shared/release-version.ts";
 
-// Schema ceilings from released tags are immutable. Unreleased source migrations
-// may advance separately; an explicit tag check still requires a new release version.
+// Record each release's schema ceiling with its version so an existing tag
+// cannot be reused for a later database structure.
 const versionSchemaMaximum = Object.freeze({
   "0.1.0": 19,
   "0.2.0": 19,
@@ -21,8 +21,9 @@ const versionSchemaMaximum = Object.freeze({
   // This fork preserves amount offsets at 36 and session metadata at 37.
   "1.0.0-alpha.2.fork.1": 37,
   "1.0.0-alpha.2.fork.2": 38,
+  "1.0.0-rc.1": 38,
+  "1.0.0-rc.1.fork.1": 39,
 });
-const currentSourceSchemaMaximum = Object.freeze({ "1.0.0-alpha.2": 37 });
 
 export function inspectVersionFiles(root, requestedTag) {
   const packageJson = JSON.parse(readFileSync(resolve(root, "package.json"), "utf8"));
@@ -69,8 +70,7 @@ export function inspectVersionFiles(root, requestedTag) {
   if (databaseMinimum === undefined || databaseMaximum === undefined) {
     errors.push("src/version.ts DATABASE_COMPATIBILITY is invalid");
   } else if (Object.hasOwn(versionSchemaMaximum, packageVersion) &&
-      Number(databaseMaximum) !== versionSchemaMaximum[packageVersion] &&
-      !(requestedTag === undefined && Number(databaseMaximum) === currentSourceSchemaMaximum[packageVersion])) {
+      Number(databaseMaximum) !== versionSchemaMaximum[packageVersion]) {
     errors.push(
       `src/version.ts schema maximum=${databaseMaximum} does not match version ${packageVersion} schema maximum=${versionSchemaMaximum[packageVersion]}; change APP_VERSION before changing a recorded schema ceiling`,
     );
