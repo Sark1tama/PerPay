@@ -4,7 +4,7 @@ import { test, expect, login, record, type Manifest } from "./fixtures";
 import { audit } from "./audit";
 
 const gridSelector = ".security-settings-card-grid";
-const cardLabels = ["管理员 IP 白名单", "密钥", "修改密码"];
+const cardLabels = ["管理员 IP 白名单", "密钥", "修改密码", "登录会话"];
 const evidenceDirectory = ".ui-audit/security-card-flow-20261021";
 
 async function configure(page: Page, theme: "light" | "dark", mode: "compact" | "full") {
@@ -43,32 +43,46 @@ async function gridGeometry(page: Page) {
       const content = item.querySelector<HTMLElement>(":scope > [data-detail-grid-content]")!;
       const card = content.querySelector<HTMLElement>('[data-slot="card"]')!;
       const box = content.getBoundingClientRect(), cardBox = card.getBoundingClientRect();
+      const itemStyle = getComputedStyle(item);
       return { index, label: card.querySelector('[data-slot="card-title"]')?.textContent,
         left: box.left - root.left, top: box.top - root.top, width: box.width, height: box.height,
         cardHeight: cardBox.height, cardContained: cardBox.top >= box.top - 1 && cardBox.bottom <= box.bottom + 1,
         clipped: content.scrollWidth > content.clientWidth + 1 || card.scrollWidth > card.clientWidth + 1,
-        span: getComputedStyle(item).gridRowEnd,
+        span: itemStyle.gridRowEnd,
+        columnSpan: Number.parseInt(itemStyle.gridColumnStart.match(/^span (\d+)$/)?.[1] ?? itemStyle.gridColumnEnd.match(/^span (\d+)$/)?.[1] ?? "1", 10),
       };
     });
     const cursors = widths.map(() => 0), previousBottoms: Array<number | null> = widths.map(() => null);
     const violations: string[] = [], verticalGaps: number[] = [];
     for (const item of items) {
-      const expectedTop = Math.min(...cursors), column = cursors.indexOf(expectedTop);
+      if (item.columnSpan < 1 || item.columnSpan > widths.length) {
+        violations.push(`item ${item.index} has an invalid column span`);
+        continue;
+      }
+      // A spanning card needs adjacent free tracks, so its earliest natural
+      // position follows the tallest occupied track within each candidate span.
+      const candidates = Array.from({ length: widths.length - item.columnSpan + 1 }, (_, column) =>
+        Math.max(...cursors.slice(column, column + item.columnSpan)));
+      const expectedTop = Math.min(...candidates), column = candidates.indexOf(expectedTop);
       const expectedLeft = widths.slice(0, column).reduce((sum, width) => sum + width, 0) + gap * column;
-      if (Math.abs(item.left - expectedLeft) > 1) violations.push(`item ${item.index} is not in the shortest column`);
+      const expectedWidth = widths.slice(column, column + item.columnSpan).reduce((sum, width) => sum + width, 0) + gap * (item.columnSpan - 1);
+      if (Math.abs(item.left - expectedLeft) > 1) violations.push(`item ${item.index} is not in the first available column span`);
       if (Math.abs(item.top - expectedTop) > 1) violations.push(`item ${item.index} leaves a vertical hole`);
-      if (Math.abs(item.width - widths[column]!) > 1) violations.push(`item ${item.index} does not fill one column`);
+      if (Math.abs(item.width - expectedWidth) > 1) violations.push(`item ${item.index} does not fill its column span`);
       if (Math.abs(item.cardHeight - item.height) > 1 || !item.cardContained) violations.push(`item ${item.index} stretches or clips its card`);
       if (item.clipped) violations.push(`item ${item.index} clips its content horizontally`);
-      if (previousBottoms[column] !== null) {
-        const actualGap = item.top - previousBottoms[column]!;
+      const occupiedBottoms = previousBottoms.slice(column, column + item.columnSpan).filter((bottom): bottom is number => bottom !== null);
+      if (occupiedBottoms.length) {
+        const actualGap = item.top - Math.max(...occupiedBottoms);
         verticalGaps.push(actualGap);
         if (actualGap < 16 - 0.02 || actualGap > 17 + 0.02) violations.push(`item ${item.index} has vertical gap ${actualGap}`);
       }
       const span = Math.max(1, Math.ceil(item.height + gap));
       if (Number.parseInt(item.span.replace("span", "").trim(), 10) !== span) violations.push(`item ${item.index} span does not match its natural height`);
-      cursors[column] = expectedTop + span;
-      previousBottoms[column] = item.top + item.height;
+      for (let track = column; track < column + item.columnSpan; track++) {
+        cursors[track] = expectedTop + span;
+        previousBottoms[track] = item.top + item.height;
+      }
       if (item.left < -1 || item.left + item.width > root.width + 1) violations.push(`item ${item.index} escapes the grid`);
     }
     for (let i = 0; i < items.length; i++) for (let j = i + 1; j < items.length; j++) {
@@ -97,6 +111,7 @@ async function settledGrid(page: Page) {
   expect(geometry.rowGap).toBe(0);
   expect(geometry.columns).toBe(geometry.width >= 1280 ? 3 : geometry.width >= 768 ? 2 : 1);
   expect(geometry.items.map(item => item.label)).toEqual(cardLabels);
+  expect(geometry.items.map(item => item.columnSpan)).toEqual([1, 1, 1, geometry.columns === 3 ? 2 : 1]);
   return geometry;
 }
 
@@ -137,6 +152,7 @@ test("security cards keep natural heights and DOM order across themes and conten
   await login(page, manifest);
   const columns = new Set<number>();
   let shortestColumnWitness = false;
+  let rightSideSessionsWitness = false;
   for (const width of [320, 390, 1440, 2190]) for (const theme of ["light", "dark"] as const) for (const mode of ["compact", "full"] as const) {
     await page.setViewportSize({ width, height: 900 });
     await configure(page, theme, mode);
@@ -152,19 +168,29 @@ test("security cards keep natural heights and DOM order across themes and conten
     expect(Math.abs(layout.width - geometry.width)).toBeLessThanOrEqual(1);
     const sessions = await page.locator("[data-login-sessions]").evaluate(element => {
       const box = element.getBoundingClientRect();
-      const grid = element.parentElement!.querySelector(".security-settings-card-grid")!.getBoundingClientRect();
-      return { width: box.width, top: box.top, gridBottom: grid.bottom, inGrid: !!element.closest(".security-settings-card-grid") };
+      const grid = element.closest(".security-settings-card-grid")!.getBoundingClientRect();
+      const item = element.closest("[data-detail-grid-item]")!.getBoundingClientRect();
+      return { width: box.width, top: box.top - grid.top, left: box.left - grid.left,
+        itemWidth: item.width, inGrid: !!element.closest(".security-settings-card-grid") };
     });
-    expect(sessions.inGrid).toBe(false);
-    expect(Math.abs(sessions.width - layout.width)).toBeLessThanOrEqual(1);
-    expect(sessions.top).toBeGreaterThanOrEqual(sessions.gridBottom + 15);
-    await record(page, info, { feature: "security-natural-card-flow", width, theme, mode, geometry, layout,
+    expect(sessions.inGrid).toBe(true);
+    expect(Math.abs(sessions.width - sessions.itemWidth)).toBeLessThanOrEqual(1);
+    expect(Math.abs(sessions.top - geometry.items[3]!.top)).toBeLessThanOrEqual(1);
+    if (geometry.columns === 3) {
+      const [whitelist, keys, password] = geometry.items;
+      expect(Math.abs(sessions.left - keys!.left)).toBeLessThanOrEqual(1);
+      expect(sessions.top).toBeGreaterThanOrEqual(Math.max(keys!.top + keys!.height, password!.top + password!.height) + 15);
+      expect(sessions.top, "sessions fill the right-side space beside the taller whitelist").toBeLessThan(whitelist!.top + whitelist!.height);
+      rightSideSessionsWitness = true;
+    }
+    await record(page, info, { feature: "security-natural-card-flow", width, theme, mode, geometry, layout, sessions,
       evidence: "isolated-synthetic-settings-fixture" });
     await capture(page, info, `security-flow-${width}-${theme}-${mode}`);
     if (width === 320 && mode === "compact") await audit(page, info, "security-flow-" + theme);
   }
   expect([...columns].sort()).toEqual([1, 2, 3]);
   expect(shortestColumnWitness, "a later security card fills the shorter column before the taller card ends").toBe(true);
+  expect(rightSideSessionsWitness, "the three-column layout places sessions below the two shorter right-hand cards").toBe(true);
   expect(errors).toEqual([]);
   expect(writes).toEqual([]);
 });
@@ -233,53 +259,14 @@ test("security drafts, validation and card identity survive resize and content-w
   expect(writes).toEqual([]);
 });
 
-test("security key view and session cancellation keep focus through card reflow without writes", async ({ page, manifest }, info) => {
-  const writes = await blockMutations(page), reveals: string[] = [];
-  // The read-only demo forbids the real reveal POST (which also writes an
-  // audit event). Fulfil this explicit view locally with a synthetic public
-  // key, so this layout test never sends a secret or a mutation to the store.
-  const syntheticPublicKey = "synthetic-public-key-for-security-card-flow";
-  await page.route("**/api/admin/v1/settings/secrets/provider_public_key/actions/reveal", async route => {
-    expect(route.request().method()).toBe("POST");
-    reveals.push(new URL(route.request().url()).pathname);
-    await route.fulfill({ json: { data: { value: syntheticPublicKey } }, headers: { "Cache-Control": "no-store" } });
-  });
+test("security session cancellation keeps focus through card reflow without writes", async ({ page, manifest }, info) => {
+  const writes = await blockMutations(page);
   await page.setViewportSize({ width: 2190, height: 900 });
   await login(page, manifest);
   await configure(page, "dark", "full");
   await openSecurity(page, manifest);
   await settledGrid(page);
   const retained = await retainItems(page);
-  const view = page.getByRole("button", { name: "查看支付宝公钥", exact: true });
-  await view.evaluate(element => element.setAttribute("data-security-flow-view", "original"));
-  await view.focus();
-  await page.keyboard.press("Enter");
-  const keyDialog = page.getByRole("dialog", { name: "支付宝公钥", exact: true });
-  const closeKey = keyDialog.getByRole("button", { name: "关闭", exact: true });
-  await expect(keyDialog.getByRole("alert")).toContainText("当前操作不可用。");
-  expect(reveals).toEqual([]);
-  await closeKey.click();
-  await expect(keyDialog).toHaveCount(0);
-  await expect(view).toBeFocused();
-  // Only this browser-side synthetic view bypasses the demo hint. The API
-  // mutation guard remains installed and the reveal response stays local.
-  await page.evaluate(() => delete document.documentElement.dataset.perpayDemo);
-  await page.keyboard.press("Enter");
-  await expect(keyDialog.getByLabel("密钥内容", { exact: true })).toHaveValue(syntheticPublicKey);
-  await keyDialog.evaluate(element => element.setAttribute("data-security-flow-dialog", "key"));
-  await closeKey.focus();
-  for (const [width, mode] of [[390, "compact"], [2190, "full"]] as const) {
-    await page.setViewportSize({ width, height: 900 });
-    await storageWidth(page, mode);
-    await settledGrid(page);
-    await expect(keyDialog).toHaveAttribute("data-security-flow-dialog", "key");
-    await expect(closeKey).toBeFocused();
-    await expectRetained(page, retained);
-  }
-  await closeKey.click();
-  await expect(keyDialog).toHaveCount(0);
-  await expect(view).toBeFocused();
-  await expect(view).toHaveAttribute("data-security-flow-view", "original");
   const session = page.getByRole("button", { name: "会话操作", exact: true });
   await session.evaluate(element => element.setAttribute("data-security-flow-session", "original"));
   await session.click();
@@ -304,10 +291,82 @@ test("security key view and session cancellation keep focus through card reflow 
   await expect(confirmation).toHaveCount(0);
   await expect(session).toBeFocused();
   await expect(session).toHaveAttribute("data-security-flow-session", "original");
-  expect(reveals).toEqual(["/api/admin/v1/settings/secrets/provider_public_key/actions/reveal"]);
   expect(writes).toEqual([]);
-  await record(page, info, { feature: "security-modal-focus-retained", reveals: "one locally fulfilled synthetic public-key view", writes });
+  await record(page, info, { feature: "security-session-modal-focus-retained", writes });
   await capture(page, info, "security-modal-focus-restored");
+});
+
+test("account key content, drafts and confirmation focus survive content-width changes without writes", async ({ page, manifest }, info) => {
+  const writes = await blockMutations(page);
+  await page.addInitScript(() => {
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText: async (value: string) => {
+      (window as Window & { __copiedText?: string }).__copiedText = value;
+    } } });
+  });
+  await page.setViewportSize({ width: 2190, height: 900 });
+  await login(page, manifest);
+  await configure(page, "dark", "full");
+  await openSecurity(page, manifest);
+  const accountEntry = page.getByRole("link", { name: "在支付宝账号中管理应用密钥", exact: true });
+  await accountEntry.focus();
+  await page.keyboard.press("Enter");
+  await expect(page).toHaveURL(manifest.origin + "/admin/settings/accounts");
+  const response = await page.request.get(manifest.origin + "/api/admin/v1/alipay-accounts");
+  expect(response.ok()).toBe(true);
+  const accounts = await response.json() as { data: { id: string; name: string; application_public_key: string | null }[] };
+  const account = accounts.data.find(item => item.application_public_key);
+  expect(account, "the isolated fixture has a configured account with a public key").toBeTruthy();
+  await page.getByRole("link", { name: "配置" + account!.name, exact: true }).click();
+  await expect(page).toHaveURL(manifest.origin + "/admin/settings/accounts/" + account!.id);
+  const keyCard = page.locator("[data-account-key-card]");
+  const publicKey = keyCard.getByText(account!.application_public_key!, { exact: true });
+  await expect(publicKey).toHaveText(account!.application_public_key!);
+  await keyCard.evaluate(element => element.setAttribute("data-security-flow-key-card", "original"));
+  const name = page.getByLabel("账号名称", { exact: true });
+  const draft = account!.name + " · 未保存的宽度验证";
+  await name.fill(draft);
+  await name.evaluate(element => element.setAttribute("data-security-flow-draft", "account"));
+  for (const [width, mode] of [[390, "compact"], [2190, "full"]] as const) {
+    await page.setViewportSize({ width, height: 900 });
+    await storageWidth(page, mode);
+    await expect(name).toHaveValue(draft);
+    await expect(name).toBeFocused();
+    await expect(name).toHaveAttribute("data-security-flow-draft", "account");
+    await expect(keyCard).toHaveAttribute("data-security-flow-key-card", "original");
+    await expect(publicKey).toHaveText(account!.application_public_key!);
+  }
+  await name.fill(account!.name);
+  const copy = keyCard.getByRole("button", { name: "复制应用公钥", exact: true });
+  await copy.focus();
+  await page.keyboard.press("Enter");
+  expect(await page.evaluate(() => (window as Window & { __copiedText?: string }).__copiedText)).toBe(account!.application_public_key);
+  await expect(copy).toBeFocused();
+  const regenerate = page.getByRole("button", { name: "更换应用密钥", exact: true });
+  await expect(regenerate).toBeEnabled();
+  await regenerate.evaluate(element => element.setAttribute("data-security-flow-view", "original"));
+  await regenerate.focus();
+  await page.keyboard.press("Enter");
+  const keyDialog = page.getByRole("alertdialog", { name: "生成新的应用密钥？", exact: true });
+  await keyDialog.evaluate(element => element.setAttribute("data-security-flow-dialog", "key-confirmation"));
+  const cancel = keyDialog.getByRole("button", { name: "取消", exact: true });
+  await cancel.focus();
+  for (const [width, mode] of [[390, "compact"], [2190, "full"]] as const) {
+    await page.setViewportSize({ width, height: 900 });
+    await storageWidth(page, mode);
+    await expect(keyDialog).toHaveAttribute("data-security-flow-dialog", "key-confirmation");
+    await expect(cancel).toBeFocused();
+    await expect(keyCard).toHaveAttribute("data-security-flow-key-card", "original");
+    await expect(name).toHaveAttribute("data-security-flow-draft", "account");
+    await expect(name).toHaveValue(account!.name);
+  }
+  await cancel.click();
+  await expect(keyDialog).toHaveCount(0);
+  await expect(regenerate).toBeFocused();
+  await expect(regenerate).toHaveAttribute("data-security-flow-view", "original");
+  await expect(publicKey).toHaveText(account!.application_public_key!);
+  expect(writes).toEqual([]);
+  await record(page, info, { feature: "account-key-content-and-modal-focus-retained", keyCharacters: account!.application_public_key!.length, writes, evidence: "real account reads from the isolated synthetic fixture; no secret reveal or key change" });
+  await capture(page, info, "account-key-modal-focus-restored");
 });
 
 test("other settings sections retain their existing 56rem maximum width", async ({ page, manifest }, info) => {
@@ -316,16 +375,18 @@ test("other settings sections retain their existing 56rem maximum width", async 
   await login(page, manifest);
   for (const mode of ["compact", "full"] as const) {
     await configure(page, "light", mode);
-    for (const section of ["provider", "collection-policy", "collection", "backup", "display", "advanced"]) {
+    for (const section of ["accounts", "collection-policy", "backup", "display", "advanced", "provider", "collection"]) {
       await page.goto(manifest.origin + "/admin/settings/" + section);
-      const layout = page.locator('.admin-settings-layout[data-settings-section="' + section + '"]');
+      const currentSection = ["provider", "collection"].includes(section) ? "accounts" : section;
+      await expect(page).toHaveURL(manifest.origin + "/admin/settings/" + currentSection);
+      const layout = page.locator('.admin-settings-layout[data-settings-section="' + currentSection + '"]');
       await expect(layout).toBeVisible();
       await expect(page.locator(gridSelector)).toHaveCount(0);
       const geometry = await layout.evaluate(element => ({ width: element.getBoundingClientRect().width,
         maxWidth: getComputedStyle(element).maxWidth, rem: parseFloat(getComputedStyle(document.documentElement).fontSize) }));
       expect(geometry.maxWidth).toBe(56 * geometry.rem + "px");
       expect(geometry.width).toBeLessThanOrEqual(56 * geometry.rem + 1);
-      await record(page, info, { feature: "non-security-settings-width-retained", section, mode, geometry });
+      await record(page, info, { feature: "non-security-settings-width-retained", section, currentSection, mode, geometry });
     }
   }
   expect(writes).toEqual([]);

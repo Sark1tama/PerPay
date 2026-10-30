@@ -46,6 +46,7 @@ const publishedMigrations = [
   { version: 36, name: "bidirectional_amount_offsets", checksum: "4f0b994a79cb8bf8755eb62956171f0cb6034239956461e8aa54b76deeb6e64f" },
   { version: 37, name: "administrator_login_session_metadata", checksum: "f9a1e10321e125d924d5629c347e8b3852f0220b920c34ff5efbf5331a409665" },
   { version: 38, name: "multiple_alipay_accounts", checksum: "5a49f43ffb730b48b537deaca9a7f24ebdccfea07e886735206f3c5eab4e5597" },
+  { version: 39, name: "alipay_account_deletion_tombstones", checksum: "1a1e78b25677d74d3a078a8606fa710d6478ebf4bea62668cbe284fa635faa37" },
 ] as const;
 
 describe("published migration catalog", () => {
