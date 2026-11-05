@@ -1,7 +1,7 @@
 import { act, fireEvent, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it } from "vitest";
-import { queryClient, type RuntimeSettings, type Site, type SiteConfiguration, type SitePolicy } from "../src/api/client";
+import { queryClient, type DashboardChartType, type RuntimeSettings, type Site, type SiteConfiguration, type SitePolicy } from "../src/api/client";
 import { json } from "./fixtures";
 import { configuredThrough, mountOnboarding } from "./onboarding-fixture";
 
@@ -26,7 +26,7 @@ function mount(path: string) {
     if (request.method === "GET") return json({ data });
     return request.json().then((body: Record<string, unknown>) => {
       writes.push(body);
-      data = { ...data, revision: data.revision + 1, display: { system_name: String(body.system_name), dashboard_chart_type: "BAR" } };
+      data = { ...data, revision: data.revision + 1, display: { ...data.display, system_name: String(body.system_name), dashboard_chart_type: body.dashboard_chart_type as DashboardChartType } };
       return json({ data });
     });
   } });
@@ -43,18 +43,32 @@ describe("website-aware instance settings", () => {
     expect(screen.queryByRole("tab", { name: "通知" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "查看应用私钥" })).not.toBeInTheDocument();
     expect(screen.getByRole("link", { name: "在支付宝账号中管理应用密钥" })).toHaveAttribute("href", "/settings/accounts");
+    expect(screen.queryByRole("list", { name: "密钥清单" })).not.toBeInTheDocument();
   });
 
-  it("saves only instance name and chart style without website display fields", async () => {
-    const view = mount("/settings/display");
+  it("saves the instance name while preserving its chart default and omitting website display fields", async () => {
+    const view = mount("/settings/display/edit");
     const name = await screen.findByRole("textbox", { name: "支付系统名称" });
     expect(screen.queryByRole("textbox", { name: "商家帮助链接" })).not.toBeInTheDocument();
     expect(screen.queryByRole("switch", { name: "收银台显示商品名称" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("group", { name: "首页图表样式" })).not.toBeInTheDocument();
+    expect(screen.getByRole("group", { name: "收款趋势默认图形" })).toBeVisible();
     fireEvent.change(name, { target: { value: "新的后台" } });
-    await userEvent.click(screen.getByRole("button", { name: "柱状图" }));
+    expect(screen.getByText("未保存")).toBeVisible();
+    expect(view.writes).toHaveLength(0);
     fireEvent.submit(name.closest("form")!);
     await waitFor(() => expect(view.writes).toHaveLength(1));
-    expect(view.writes[0]).toEqual({ revision: expect.any(Number), system_name: "新的后台", dashboard_chart_type: "BAR" });
+    expect(view.writes[0]).toEqual({ revision: expect.any(Number), system_name: "新的后台", dashboard_chart_type: "AREA" });
+  });
+
+  it("edits the chart default in the instance display form without submitting website fields", async () => {
+    const view = mount("/settings/display/edit");
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("button", { name: "柱状图" }));
+    expect(view.writes).toHaveLength(0);
+    await user.click(screen.getByRole("button", { name: "保存" }));
+    await waitFor(() => expect(view.writes).toHaveLength(1));
+    expect(view.writes[0]).toEqual({ revision: expect.any(Number), system_name: "实例后台", dashboard_chart_type: "BAR" });
   });
 
   it("explains the retired notification page and links to websites", async () => {

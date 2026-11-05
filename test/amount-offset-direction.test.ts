@@ -212,7 +212,7 @@ it("serves downward orders through the signed API and restores their policy and 
   } finally { f.close(); }
 });
 
-for (const sourceSchema of [37, 38]) {
+for (const sourceSchema of [37, 38, 39]) {
 it(`upgrades fork schema ${sourceSchema} with one-cent orders while preserving amount policy, keys and checkout evidence`, async () => {
   const directory = mkdtempSync(join(tmpdir(), "perpay-offset-upgrade-"));
   const legacy = await createConfiguredLegacyHttpServices({ directory, apiSecret: null, collectionCodePayload: "https://qr.alipay.com/offset-fork-upgrade" });
@@ -238,11 +238,12 @@ it(`upgrades fork schema ${sourceSchema} with one-cent orders while preserving a
     oldOrders.close(closed.orderId);
     const policy = sites.get(site.clientId)!.configuration.policy;
     const oldProvider = settings.instanceSnapshot().provider;
-    if (sourceSchema === 38) legacy.database.write(db => {
-      const migration = migrations.find(item => item.version === 38)!;
-      db.exec(migration.sql);
-      migrateAlipayAccounts(db, legacy.config.masterKey);
-      db.prepare("INSERT INTO schema_migrations VALUES (?, ?, ?, ?)").run(migration.version, migration.name, migrationChecksum(migration), new Date().toISOString());
+    if (sourceSchema >= 38) legacy.database.write(db => {
+      for (const migration of migrations.filter(item => item.version >= 38 && item.version <= sourceSchema)) {
+        db.exec(migration.sql);
+        if (migration.postApply === "migrate_alipay_accounts_v1") migrateAlipayAccounts(db, legacy.config.masterKey);
+        db.prepare("INSERT INTO schema_migrations VALUES (?, ?, ?, ?)").run(migration.version, migration.name, migrationChecksum(migration), new Date().toISOString());
+      }
     });
     const tables = ["payment_orders", "amount_slots", "order_events", "checkout_sessions"];
     const before = tables.map(table => legacy.database.read(db => db.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all()));

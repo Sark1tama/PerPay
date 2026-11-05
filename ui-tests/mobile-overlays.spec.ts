@@ -1,6 +1,7 @@
 import type { Locator, Page } from "@playwright/test";
 import { test, expect, login, record } from "./fixtures";
 import { expectTouchTarget } from "./touch-targets";
+import { openRecord } from "./overlay-fixtures";
 
 type VisibleArea = { width: number; height: number; left: number; top: number };
 const panned: VisibleArea = { width: 280, height: 260, left: 24, top: 32 };
@@ -91,6 +92,7 @@ test.describe("mobile overlay regression with synthetic visible viewport", () =>
       await page.evaluate(font => document.documentElement.style.fontSize = font + "%", font);
       await page.clock.runFor(200);
       const pageWidthBefore = await page.evaluate(() => document.documentElement.scrollWidth);
+      const columnsBefore = await page.evaluate(() => localStorage.getItem("perpay.table-columns.v2.orders"));
       const more = page.getByRole("button", { name: "更多订单操作", exact: true });
       await more.evaluate(element => element.scrollIntoView({ block: "center", inline: "nearest" }));
       await page.clock.runFor(100);
@@ -122,21 +124,19 @@ test.describe("mobile overlay regression with synthetic visible viewport", () =>
       await expect(comfortable).toHaveAttribute("aria-pressed", "true");
       expect(await page.evaluate(() => localStorage.getItem("perpay:list-density"))).toBe("comfortable");
 
-      const received = display.getByRole("checkbox", { name: "实收金额", exact: true });
-      await expect(received).toBeChecked();
-      const receivedLabel = display.locator('[data-slot="field-label"]').filter({ hasText: /^实收金额$/ });
-      const field = await scrollControl(receivedLabel);
-      // Tap the measured label without auto-scrolling its associated hidden input again.
-      const fieldBox = (await receivedLabel.boundingBox())!;
-      await page.touchscreen.tap(fieldBox.x + fieldBox.width / 2, fieldBox.y + fieldBox.height / 2);
-      await expect(received).not.toBeChecked();
-      await expect.poll(() => page.evaluate(() => JSON.parse(localStorage.getItem("perpay.table-columns.v2.orders") ?? "{}").received_amount_cents)).toBe(false);
-
-      const reset = display.getByRole("button", { name: "恢复默认列", exact: true });
-      const resetGeometry = await scrollControl(reset);
-      await reset.click();
-      await expect(received).toBeChecked();
-      await expect.poll(() => page.evaluate(() => localStorage.getItem("perpay.table-columns.v2.orders"))).toBe("{}");
+      const compact = display.getByRole("button", { name: "紧凑", exact: true });
+      const compactGeometry = await scrollControl(compact);
+      await compact.click();
+      await expect(compact).toHaveAttribute("aria-pressed", "true");
+      expect(await page.evaluate(() => localStorage.getItem("perpay:list-density"))).toBe("compact");
+      await scrollControl(comfortable);
+      await comfortable.click();
+      await expect(comfortable).toHaveAttribute("aria-pressed", "true");
+      const explanation = display.getByText("手机列表展示关键摘要，完整信息可打开详情查看。", { exact: true });
+      await explanation.scrollIntoViewIfNeeded();
+      await expect(explanation).toBeInViewport();
+      await expect(display.getByRole("checkbox")).toHaveCount(0);
+      expect(await page.evaluate(() => localStorage.getItem("perpay.table-columns.v2.orders"))).toBe(columnsBefore);
 
       const done = display.getByRole("button", { name: "完成", exact: true });
       const doneGeometry = await scrollControl(done);
@@ -157,7 +157,7 @@ test.describe("mobile overlay regression with synthetic visible viewport", () =>
       expect(layout.popup.scrollWidth).toBeLessThanOrEqual(layout.popup.width + 1);
       expect(layout.pageWidth).toBeLessThanOrEqual(pageWidthBefore + 1);
       await info.attach("list-display-geometry", {
-        body: Buffer.from(JSON.stringify({ evidence: "browser touch viewport with enlarged text", width, height, font, pageWidthBefore, layout, density, field, resetGeometry, doneGeometry, doneBottomSpace }, null, 2)),
+        body: Buffer.from(JSON.stringify({ evidence: "browser touch viewport with enlarged text", width, height, font, pageWidthBefore, layout, density, compactGeometry, doneGeometry, doneBottomSpace }, null, 2)),
         contentType: "application/json",
       });
       await info.attach(`list-display-${width}-${height}-${font}`, { body: await page.screenshot(), contentType: "image/png" });
@@ -226,43 +226,51 @@ test.describe("mobile overlay regression with synthetic visible viewport", () =>
     await expect(trigger).toBeFocused();
   });
 
-  test("administrator confirmation keeps its explanation scrollable and both actions reachable", async ({ page, manifest }, info) => {
+  test("administrator confirmation keeps its explanation readable and both actions reachable", async ({ page, manifest }, info) => {
     await login(page, manifest);
-    await page.goto(manifest.origin + "/admin/settings/security");
-    const rules = page.getByRole("textbox", { name: "允许的 IP / 网段", exact: true });
+    const editor = await openRecord(page, manifest, "/settings/security/access");
+    const rules = editor.getByRole("textbox", { name: "允许的 IP / 网段", exact: true });
     await rules.fill(Array.from({ length: 30 }, (_, index) => `192.0.2.${index + 1}`).join("\n"));
-    const save = page.getByRole("button", { name: "保存白名单", exact: true });
+    const save = editor.getByRole("button", { name: "保存白名单", exact: true });
     await save.click();
-    const dialog = page.getByRole("dialog", { name: "确认保存访问规则？", exact: true });
+    const dialog = page.locator("[data-overlay-step]:visible");
     await expect(dialog).toBeVisible();
+    await expect(dialog).toHaveAccessibleName("确认保存访问规则？");
     const small = { ...panned, height: 220 };
     await visibleArea(page, small);
     const close = dialog.getByRole("button", { name: "关闭对话框", exact: true });
     const closeGeometry = await reachable(close);
     const explanation = dialog.locator("[data-admin-dialog-body]");
     await expect(explanation).toHaveText(/保存立即生效/);
-    const scroll = dialog.locator("[data-admin-dialog-scroll]");
+    const scroll = dialog.locator("[data-overlay-step-scroll]");
     await expect.poll(() => scroll.evaluate(element => element.clientHeight)).toBeGreaterThanOrEqual(64);
-    await scroll.evaluate(element => element.scrollTop = element.scrollHeight);
-    await expect.poll(() => scroll.evaluate(element => element.scrollTop)).toBeGreaterThan(0);
+    const reading = await scroll.evaluate(element => ({ height: element.clientHeight, scrollHeight: element.scrollHeight }));
+    if (reading.scrollHeight > reading.height) {
+      await scroll.evaluate(element => element.scrollTop = element.scrollHeight);
+      await expect.poll(() => scroll.evaluate(element => element.scrollTop)).toBeGreaterThan(0);
+    } else {
+      await expect(explanation.locator('[data-slot="dialog-description"]')).toBeInViewport({ ratio: 1 });
+    }
     const confirmGeometry = await scrollTo(dialog.getByRole("button", { name: "确认保存", exact: true }), page);
     const cancel = dialog.getByRole("button", { name: "取消", exact: true });
     const cancelGeometry = await scrollTo(cancel, page);
-    await record(page, info, { evidence: "browser synthetic visualViewport", area: small, closeGeometry, confirmGeometry, cancelGeometry });
+    await record(page, info, { evidence: "browser synthetic visualViewport", area: small, reading, closeGeometry, confirmGeometry, cancelGeometry });
     await cancel.click();
     await expect(dialog).toHaveCount(0);
     await expect(save).toBeFocused();
     await expect(rules).toHaveValue(/192\.0\.2\.30/);
   });
 
-  test("dirty navigation alert keeps both decisions reachable and restores the category focus", async ({ page, manifest }, info) => {
+  test("dirty editor close alert keeps both decisions reachable and restores the close action focus", async ({ page, manifest }, info) => {
     await login(page, manifest);
     await page.goto(manifest.origin + "/admin/settings/display");
-    const name = page.getByRole("textbox", { name: "支付系统名称", exact: true });
+    await page.getByRole("link", { name: "编辑界面显示", exact: true }).click();
+    const editor = page.locator("[data-overlay-content]");
+    const name = editor.getByRole("textbox", { name: "支付系统名称", exact: true });
     await name.fill("保留的手机草稿");
-    const category = page.getByRole("combobox", { name: "设置分类", exact: true });
-    await category.click();
-    await page.getByRole("option", { name: "查账设置", exact: true }).click();
+    const source = page.url();
+    const close = editor.locator("[data-overlay-footer]").getByRole("button", { name: "关闭", exact: true });
+    await close.click();
     const dialog = page.getByRole("alertdialog", { name: "放弃未保存的修改？", exact: true });
     await expect(dialog).toBeVisible();
     const small = { ...panned, height: 220 };
@@ -273,9 +281,9 @@ test.describe("mobile overlay regression with synthetic visible viewport", () =>
     await record(page, info, { evidence: "browser synthetic visualViewport", area: small, discardGeometry, stayGeometry });
     await stay.click();
     await expect(dialog).toHaveCount(0);
-    await expect(category).toBeFocused();
+    await expect(close).toBeFocused();
     await expect(name).toHaveValue("保留的手机草稿");
-    expect(new URL(page.url()).pathname).toBe("/admin/settings/display");
+    expect(page.url()).toBe(source);
   });
 
   test("trend tab text stays on one line and each view remains reachable at 320 and 360px", async ({ page, manifest }, info) => {

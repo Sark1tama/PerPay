@@ -1,5 +1,7 @@
 /** Every code that can be returned in the public HTTP error envelope. */
 export const HTTP_ERROR_CODES = Object.freeze([
+  "audit_event_not_found",
+  "audit_query_unavailable",
   "alipay_account_not_found",
   "alipay_accounts_unavailable",
   "alipay_account_revision_conflict",
@@ -81,6 +83,7 @@ export const HTTP_ERROR_CODES = Object.freeze([
   "system_not_configured",
   "system_not_ready",
   "unsupported_media_type",
+  "update_check_rate_limited",
   "update_check_unavailable",
   "validation_failed",
   "webhook_delivery_not_found",

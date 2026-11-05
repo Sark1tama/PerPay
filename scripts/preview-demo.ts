@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { parseArgs } from "node:util";
-import { serve } from "@hono/node-server";
+import { serve, type HttpBindings } from "@hono/node-server";
 import { Hono } from "hono";
 
 import { loadConfig } from "../src/config.ts";
@@ -20,10 +20,15 @@ import { LedgerStore } from "../src/ledger/store.ts";
 import { ReconciliationStore } from "../src/reconciliation/store.ts";
 import { WebhookStore, type CompleteWebhookAttemptInput } from "../src/notifications/store.ts";
 import { assessWebhookAck } from "../src/notifications/model.ts";
-import { createApp } from "../src/http/app.ts";
+import { createApp, type AppDependencies } from "../src/http/app.ts";
+import { SettingsError } from "../src/settings/store.ts";
 import { systemAnalytics } from "../src/http/system-analytics.ts";
 import { renderCollectionCodeSvg } from "../src/http/web/collection-code.ts";
 import { OfficialUpdateChecker, UpdateCheckUnavailable } from "../src/update/checker.ts";
+import { ActivityRecorder } from "../src/audit/activity.ts";
+import { createAuditContext, runWithAuditContext } from "../src/audit/context.ts";
+import { appendAuditEvent } from "../src/database/identity-store.ts";
+import { APP_VERSION, DATABASE_COMPATIBILITY } from "../src/version.ts";
 import type { SiteSnapshot } from "../src/sites/model.ts";
 import { seedFinancialScenarios } from "./preview-financial-scenarios.ts";
 import { seedNotificationScenarios } from "./preview-notification-scenarios.ts";
@@ -51,7 +56,7 @@ const sample = (day: number, key: string) => createHash("sha256").update("perpay
   .digest().readUInt32BE(0) / 0x1_0000_0000;
 const beijing = (time: number) => new Date(time + 8 * 3_600_000).toISOString().slice(0, 19).replace("T", " ");
 
-export async function createPreviewDemo(options: { port?: number; now?: number; clock?: () => number; updateChecker?: Pick<OfficialUpdateChecker, "check"> } = {}) {
+export async function createPreviewDemo(options: { port?: number; now?: number; clock?: () => number; interactive?: boolean; updateChecker?: Pick<OfficialUpdateChecker, "check"> } = {}) {
   const port = options.port ?? 6192;
   if (!Number.isInteger(port) || port < 1024 || port > 65535) throw new Error("演示端口必须在 1024–65535 之间。");
   const capturedAt = options.now ?? Date.now();
@@ -60,6 +65,7 @@ export async function createPreviewDemo(options: { port?: number; now?: number; 
   const temporaryRoot = realpathSync(tmpdir());
   const directory = mkdtempSync(join(temporaryRoot, "perpay-preview-"));
   let database: AppDatabase | undefined;
+  let activity: ActivityRecorder | undefined;
   let disposed = false;
   const dispose = () => {
     if (disposed) return;
@@ -67,6 +73,7 @@ export async function createPreviewDemo(options: { port?: number; now?: number; 
     const target = realpathSync(directory);
     assert.equal(dirname(target), temporaryRoot);
     assert.ok(basename(target).startsWith("perpay-preview-"));
+    activity?.stop();
     database?.close();
     rmSync(target, { recursive: true, force: true });
     disposed = true;
@@ -82,14 +89,19 @@ export async function createPreviewDemo(options: { port?: number; now?: number; 
     const db = await AppDatabase.open(config.databasePath, { masterKey: config.masterKey });
     database = db;
     let liveStarted: number | null = null;
-    const liveNow = () => options.clock?.() ?? capturedAt + (liveStarted === null ? 0 : Math.floor(performance.now() - liveStarted));
+    // Normal previews share the wall clock used by administrator settings writes.
+    // Explicit fixture dates keep their reproducible timeline after seeding.
+    const liveNow = () => options.clock?.() ?? (options.now === undefined ? Date.now()
+      : capturedAt + (liveStarted === null ? 0 : Math.floor(performance.now() - liveStarted)));
     const identity = new IdentityService(db, liveNow);
     await identity.initialize();
-    // Fixed only for this loopback-only, disposable read-only demo; never used by main.ts.
+    // Fixed only for this loopback-only, disposable demo; never used by main.ts.
     const password = "123456";
     await identity.setupAdmin(password);
     const settingsStore = new RuntimeSettingsStore(db, config.masterKey);
-    const settings = new RuntimeSettingsService({ store: settingsStore });
+    const settings = new RuntimeSettingsService({ store: settingsStore, verifyProviderApplicationKey: async () => {
+      throw new SettingsError("provider_application_key_verification_failed", "本地演示未连接支付宝，无法检查连接或启用密钥。 当前密钥未更换。");
+    } });
     settings.initialize();
     const ledger = new LedgerStore(db);
     const historicalLedger = seedHistoricalLedgerSource(ledger, capturedAt);
@@ -97,10 +109,12 @@ export async function createPreviewDemo(options: { port?: number; now?: number; 
     const application = generateKeyPairSync("rsa", { modulusLength: 2048 });
     const platform = generateKeyPairSync("rsa", { modulusLength: 2048 });
     const accounts = settings.accountService()!;
+    // Use official source identities; temporary stores and the offline app
+    // isolate this fixture, and no provider or notification transport is created.
     const account = await accounts.create({
       name: "演示收款账号", enabled: true,
       code_payload: "https://qr.alipay.com/perpay-documentation-no-real-payment",
-      environment: "SANDBOX", app_id: "2026000000000001",
+      environment: "PRODUCTION", app_id: "2026000000000001",
       private_key: application.privateKey.export({ format: "pem", type: "pkcs8" }).toString(),
       platform_public_key: platform.publicKey.export({ format: "pem", type: "spki" }).toString(),
     }, audit);
@@ -386,10 +400,47 @@ export async function createPreviewDemo(options: { port?: number; now?: number; 
         unconfigured: unconfiguredSite.clientId, no_notifications: noNotificationSite.clientId, limited: limitedSite.clientId } };
 
     liveStarted = performance.now();
+    activity = new ActivityRecorder({ database: db, clock: liveNow });
+    const sampleMinute = Math.floor((capturedAt - 3 * MINUTE) / MINUTE) * MINUTE;
+    for (const [offset, count, durationMs] of [[10_000, 17, 320], [35_000, 1, 40]] as const) {
+      activity.record({ action: "http.request", sourceType: "HTTP", actorType: "API_CLIENT", actorId: demoSites[0]!.clientId,
+        siteId: demoSites[0]!.clientId, siteName: demoSites[0]!.configuration.name, sourceAddress: "203.0.113.12", userAgent: "PerPayDemo/1.0",
+        httpMethod: "GET", route: "/api/v1/orders/:orderId", httpStatus: 200, aggregate: true, count, durationMs, occurredAt: sampleMinute + offset });
+    }
+    activity.record({ action: "http.request", sourceType: "HTTP", actorType: "ANONYMOUS", outcome: "FAILURE",
+      sourceAddress: "198.51.100.28", userAgent: "curl/8.12.0", httpMethod: "GET", route: "/api/public/v1/checkouts/:token",
+      httpStatus: 404, durationMs: 4, occurredAt: capturedAt - 4 * MINUTE, details: { error_code: "checkout_not_found" } });
+    activity.record({ action: "http.request", sourceType: "HTTP", actorType: "ADMIN", actorId: "admin",
+      sourceAddress: "203.0.113.16", userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/140.0.0.0",
+      httpMethod: "POST", route: "/api/admin/v1/system/ledger/scan", httpStatus: 202, durationMs: 8, occurredAt: capturedAt - 2 * MINUTE - 1000 });
+    activity.record({ action: "ledger.scan", sourceType: "BACKGROUND", actorType: "SYSTEM", actorId: "ledger.scan", durationMs: 840,
+      subjectType: "provider_account", subjectId: providerAccountKey, occurredAt: capturedAt - 2 * MINUTE,
+      details: { created_entries: 12, pages: 1, reason: "manual", status: "COMPLETED" } });
+    activity.record({ action: "reconciliation.sweep", sourceType: "BACKGROUND", actorType: "SYSTEM", actorId: "reconciliation.sweep",
+      aggregate: true, count: 6, durationMs: 18, occurredAt: capturedAt - 5 * MINUTE,
+      details: { reason: "scheduled", processed_entries: 0, processed_orders: 0, auto_settled: 0, failures: 0 } });
+    activity.record({ action: "webhook.delivery", sourceType: "BACKGROUND", actorType: "SYSTEM", outcome: "FAILURE", actorId: "webhook.delivery",
+      siteId: notificationSite.clientId, siteName: notificationSite.configuration.name, occurredAt: capturedAt - MINUTE,
+      durationMs: 2100, details: { error_code: "receiver_unavailable", attempt_number: 2, delivery_outcome: "RETRY", reason: "scheduled" } });
+    activity.record({ action: "backup.cycle", sourceType: "MAINTENANCE", actorType: "SYSTEM", actorId: "backup", durationMs: 1800,
+      occurredAt: capturedAt - 8 * HOUR, details: { schema_version: DATABASE_COMPATIBILITY.maximum, backup_size_bytes: 1_240_064,
+        deleted_backups: 1, reason: "documentation_preview" } });
+    activity.record({ action: "system.started", sourceType: "INTERNAL", actorType: "SYSTEM", occurredAt: capturedAt - 8 * DAY,
+      details: { version: APP_VERSION, reason: "documentation_preview" } });
+    // Synthetic maintenance evidence belongs only to this disposable demonstration database.
+    runWithAuditContext(createAuditContext({ actorType: "SYSTEM", actorId: "maintenance" }), () => {
+      db.write(connection => appendAuditEvent(connection, { actorType: "SYSTEM", actorId: "maintenance",
+        action: "maintenance.publication_lock.clear", outcome: "SUCCESS", occurredAt: capturedAt - 30_000,
+        subjectType: "instance", subjectId: db.instanceId(), details: { reason: "documentation_preview", command: "clear-stale-publication-lock" } }));
+      activity!.record({ action: "maintenance.publication_lock.clear", sourceType: "MAINTENANCE", durationMs: 45,
+        occurredAt: capturedAt - 30_000, details: { reason: "documentation_preview", exit_code: 0 } });
+    });
+    activity.flush();
+    activity.start();
     // Health is explicitly simulated; no scheduler, provider client or webhook transport runs.
     const healthy = () => ({ enabled: true, state: "healthy" as const, inFlight: false, lastAttemptAt: liveNow() - 3000, lastSuccessAt: liveNow() - 2000, lastErrorCode: null, consecutiveFailures: 0, paymentRevision: settings.instanceSnapshot().paymentRevision });
-    const app = createApp({
-      config, database: db, identity, settings, sites, orders, ledger, reconciliation, webhookStore: webhooks,
+    const dependencies: AppDependencies = {
+      config, database: db, activity, identity, settings, sites, orders, ledger, reconciliation, webhookStore: webhooks,
       startedAt: new Date(capturedAt - 8 * DAY), clock: liveNow, demoMode: true,
       runtimeStatus: () => ({ configured: true, transitioning: false,
         paymentRevision: settings.instanceSnapshot().paymentRevision, activeProviderAccountKey: providerAccountKey,
@@ -401,28 +452,36 @@ export async function createPreviewDemo(options: { port?: number; now?: number; 
       // Default fixtures stay offline. Interactive previews can explicitly supply
       // the official metadata checker without starting any payment transports.
       updateChecker: options.updateChecker ?? { check: async () => { throw new UpdateCheckUnavailable(3600); } },
-    });
-    const preview = new Hono();
+    };
+    const app = createApp({ ...dependencies, demoMode: !options.interactive });
+    // Payer pages always retain the demo bootstrap and disabled payment probes.
+    const publicApp = options.interactive ? createApp({ ...dependencies, demoMode: true }) : app;
+    const preview = new Hono<{ Bindings: Partial<HttpBindings> }>();
     preview.use("*", async (context, next) => {
-      context.header("X-PerPay-Demo", "read-only; health=simulated");
+      const marker = (options.interactive ? "interactive; storage=temporary" : "read-only") + "; health=simulated";
+      context.header("X-PerPay-Demo", marker);
       const sessionAction = context.req.method === "POST" && ["/api/admin/v1/session/login", "/api/admin/v1/session/logout"].includes(context.req.path);
-      const exportRead = context.req.method === "POST" && /^\/api\/admin\/v1\/(?:sites\/[^/]+\/)?orders\/export$/.test(context.req.path);
-      if (!["GET", "HEAD"].includes(context.req.method) && !sessionAction && !exportRead) {
+      const exportRead = context.req.method === "POST" && (context.req.path === "/api/admin/v1/audit-events/export" || /^\/api\/admin\/v1\/(?:sites\/[^/]+\/)?orders\/export$/.test(context.req.path));
+      // Only existing administrator routes can write the private temporary store.
+      // Authentication, Origin, CSRF, revisions and idempotency stay in the real app.
+      const localEdit = options.interactive && context.req.path.startsWith("/api/admin/v1/");
+      if (!["GET", "HEAD"].includes(context.req.method) && !sessionAction && !exportRead && !localEdit) {
         return context.json({ error: { code: "demo_read_only", message: "当前操作不可用。" } }, 403);
       }
       await next();
+      context.header("X-PerPay-Demo", marker);
     });
     // Replace the displayed code with plain text, so a screenshot can never initiate payment.
     // Gate through the real route first, preserving token/status checks and security headers.
     preview.get("/api/public/v1/checkouts/:token/qr.svg", async context => {
-      const response = await app.fetch(context.req.raw);
+      const response = await publicApp.fetch(context.req.raw, context.env);
       if (!response.ok) return response;
       const headers = new Headers(response.headers);
       headers.delete("content-length");
       headers.delete("etag");
       return new Response(renderCollectionCodeSvg(DEMO_QR_TEXT), { headers });
     });
-    preview.route("/", app);
+    preview.all("*", context => (context.req.path.startsWith("/checkout/") || context.req.path.startsWith("/api/public/") ? publicApp : app).fetch(context.req.raw, context.env));
     return { app: preview, database: db, directory, origin, password, capturedAt, stats, scenarios, featured: featured.orderId, failed: failed.orderId, retry: retry.orderId, checkout: checkout.checkoutToken, dispose };
   } catch (error) {
     dispose();
@@ -431,16 +490,17 @@ export async function createPreviewDemo(options: { port?: number; now?: number; 
 }
 
 async function main() {
-  const { values } = parseArgs({ options: { port: { type: "string" }, "official-updates": { type: "boolean", default: false } } });
+  const { values } = parseArgs({ options: { port: { type: "string" }, "interactive": { type: "boolean", default: false }, "official-updates": { type: "boolean", default: false } } });
   for (const path of ["web-dist/admin/index.html", "web-dist/checkout/.vite/manifest.json"]) {
     if (!existsSync(resolve(path))) throw new Error("请先在仓库根目录执行 npm run build。");
   }
   const demo = await createPreviewDemo({
     ...(values.port === undefined ? {} : { port: Number(values.port) }),
+    interactive: values.interactive,
     ...(values["official-updates"] ? { updateChecker: new OfficialUpdateChecker() } : {}),
   });
   const server = serve({ fetch: demo.app.fetch, hostname: "127.0.0.1", port: Number(new URL(demo.origin).port) }, () => {
-    console.log("\nPerPay 本地预览 · 官方更新查询" + (values["official-updates"] ? "已启用" : "未启用"));
+    console.log("\nPerPay 本地预览 · " + (values.interactive ? "可编辑临时数据" : "只读") + " · 官方更新查询" + (values["official-updates"] ? "已启用" : "未启用"));
     console.log(JSON.stringify({ origin: demo.origin, password: demo.password, capturedAt: demo.capturedAt, featured: demo.featured, retry: demo.retry, failed: demo.failed, checkout: demo.checkout, checkoutExpiresAt: new Date(demo.capturedAt + 22 * MINUTE).toISOString(), orders: demo.stats.orders, daily: demo.stats.daily, directory: demo.directory, scenarios: demo.scenarios }, null, 2));
     console.log("\n访问 " + demo.origin + "/admin/，按 Ctrl+C 退出并清理临时数据。");
   });

@@ -131,7 +131,8 @@ describe("readable payment match detail", () => {
     expect(screen.queryByRole("button", { name: "匹配依据" })).not.toBeInTheDocument();
     for (const label of ["商户订单号（业务网站）", "支付宝订单号", "支付宝商户单号", "支付宝交易备注", "金额占用时间", "关联理由", "撤销理由"]) {
       const field = screen.getByText(label, { selector: "dt" }).parentElement;
-      expect(field).toHaveAttribute("data-field-wide", "true");
+      if (label === "商户订单号（业务网站）") expect(field).not.toHaveAttribute("data-field-wide", "true");
+      else expect(field).toHaveAttribute("data-field-wide", "true");
       expect(field?.closest('[data-detail-fields]')).toHaveAttribute("data-layout", "flow");
       expect(field?.querySelector("dd")).not.toBeEmptyDOMElement();
     }
@@ -195,7 +196,7 @@ describe("readable payment match detail", () => {
       expect(factGroup).toHaveAttribute("data-density", "default");
       expect(factGroup).toHaveAttribute("data-layout", "columns");
     }
-    expect(await recordAction("单独打开", "收款关联记录操作")).toHaveAttribute("href", "/reconciliation/matches/" + matchId);
+    expect(await recordAction("查看详情", "收款关联记录操作")).toHaveAttribute("href", "/reconciliation/matches/" + matchId);
   });
 
   it("restores focus after a unified association moves into history on successful reversal", async () => {

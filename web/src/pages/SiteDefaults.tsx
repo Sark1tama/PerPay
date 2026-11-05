@@ -1,4 +1,6 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
+import { OverlayActions } from "@/components/overlay-actions";
+import { useOverlayCloseGuard, useOverlayContext } from "@/lib/overlay-context";
 import { PageHeading } from "@/components/page-heading";
 import { onlineManager, useMutation, useQuery } from "@tanstack/react-query";
 import { api, ApiError, queryClient, result, type SitePolicy } from "@/api/client";
@@ -11,6 +13,7 @@ import { SiteConfigurationConflicts } from "@/components/site-configuration-conf
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { FieldSet } from "@/components/ui/field";
+import { ScrollingTabs } from "@/components/scrolling-tabs";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   mergeSitePolicy,
@@ -50,6 +53,8 @@ export default function SiteDefaultsPage() {
 }
 
 function DefaultsEditor({ initial }: { initial: DefaultsSnapshot }) {
+  const overlay = useOverlayContext();
+  const formId = useId();
   const [section, setSection] = useState("orders");
   const formRef = useRef<HTMLFormElement>(null);
   const [saved, setSaved] = useState(initial);
@@ -142,6 +147,7 @@ function DefaultsEditor({ initial }: { initial: DefaultsSnapshot }) {
   });
 
   const busy = save.isPending || reload.isPending;
+  useOverlayCloseGuard(() => busy);
   const requiresReview = needsReview || !!review || (initial.revision > saved.revision && dirty);
   useEffect(() => {
     if (busy || initial.revision <= saved.revision) return;
@@ -172,11 +178,13 @@ function DefaultsEditor({ initial }: { initial: DefaultsSnapshot }) {
       <PageHeading title="网站默认模板" />
       <p className="text-sm text-muted-foreground">仅用于新网站，已有网站不变。</p>
       <Tabs value={section} onValueChange={value => { if (value) setSection(value); }}>
-        <TabsList aria-label="模板分组">
-          <TabsTrigger value="orders">订单设置</TabsTrigger>
-          <TabsTrigger value="display">收银台展示</TabsTrigger>
-          <TabsTrigger value="integration">通知策略</TabsTrigger>
-        </TabsList>
+        <ScrollingTabs>
+          <TabsList className="min-w-max" aria-label="模板分组" activateOnFocus={false}>
+            <TabsTrigger value="orders">订单设置</TabsTrigger>
+            <TabsTrigger value="display">收银台展示</TabsTrigger>
+            <TabsTrigger value="integration">通知策略</TabsTrigger>
+          </TabsList>
+        </ScrollingTabs>
       </Tabs>
       <ErrorNotice error={save.error} />
       <ErrorNotice error={reload.error} />
@@ -205,7 +213,7 @@ function DefaultsEditor({ initial }: { initial: DefaultsSnapshot }) {
           saveLabel="保存默认模板"
         />
       )}
-      <form ref={formRef} onSubmit={event => {
+      <form id={formId} ref={formRef} onSubmit={event => {
         event.preventDefault();
         if (!busy && !requiresReview && !timeoutError) save.mutate();
       }}>
@@ -223,7 +231,10 @@ function DefaultsEditor({ initial }: { initial: DefaultsSnapshot }) {
               save.reset();
             }}
           />
-          <Button type="submit" className="w-fit" disabled={busy || requiresReview || !!timeoutError}>保存默认模板</Button>
+          <OverlayActions>
+            {overlay && <Button type="button" variant="outline" disabled={busy} onClick={() => overlay.requestClose()}>关闭</Button>}
+            <Button form={formId} type="submit" disabled={busy || requiresReview || !!timeoutError}>保存默认模板</Button>
+          </OverlayActions>
         </FieldSet>
       </form>
     </div>

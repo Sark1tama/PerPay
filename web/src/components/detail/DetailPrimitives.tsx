@@ -1,13 +1,14 @@
 import { useQuery } from '@/lib/workspace-query';
 import { useWorkspaceApi } from "@/workspace";
-import { useId, useRef, type ReactNode } from "react";
+import { useId, useRef, useState, type ReactNode } from "react";
 import { useIsFetching } from '@tanstack/react-query';
-import { ArrowLeft, ExternalLink } from "lucide-react";
+import { ArrowLeft, Code, ExternalLink, X } from "lucide-react";
 import { result, type AdminOrderDetail, type ReconciliationOrder } from "@/api/client";
 import { Link } from "@/navigation";
 import { ListDateTime, ListMoney } from "@/components/list-primitives";
 import { cn } from "@/lib/utils";
 import { CopyValue } from "@/components/copy-value";
+import { useOverlayContext } from "@/lib/overlay-context";
 import { StatusBadge, paymentBasisDescription } from "@/components/business-status";
 import { ErrorNotice, Loading } from "@/components/request-state";
 import { Button, buttonVariants } from "@/components/ui/button";
@@ -19,6 +20,7 @@ import {
   DialogTitle,
   DialogFooter,
   DialogClose,
+  DialogBody,
 } from "@/components/admin-dialog";
 import {
   Item,
@@ -39,6 +41,7 @@ const detailQueryScopes = new Set([
   "notification",
   "notification-attempts",
   "conflict",
+  "audit-event",
 ]);
 export function useDetailFetching() {
   return useIsFetching({
@@ -48,7 +51,7 @@ export function useDetailFetching() {
 export type DetailDensity = "default" | "comfortable";
 export type DetailFieldLayout = "columns" | "flow";
 export function DetailPage({ children }: { children: ReactNode }) {
-  return <div className="flex min-w-0 flex-col gap-6" data-detail-page data-detail-layout="readable">{children}</div>;
+  return <div className="flex min-w-0 flex-col gap-4" data-detail-page data-detail-layout="readable">{children}</div>;
 }
 export function DetailNavigation({ back, identifier, identifierLabel = "记录编号", global = false, children }: {
   back: { to: string; label: string; state?: unknown };
@@ -57,6 +60,8 @@ export function DetailNavigation({ back, identifier, identifierLabel = "记录�
   global?: boolean;
   children?: ReactNode;
 }) {
+  const overlay = useOverlayContext();
+  if (overlay) return children ? <div className="contents" data-detail-navigation>{children}</div> : null;
   return <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-2" data-detail-navigation>
     <Link global={global} to={back.to} state={back.state} className={buttonVariants({ variant: "ghost", size: "sm" })}>
       <ArrowLeft data-icon="inline-start" />{back.label}
@@ -82,9 +87,10 @@ export function DetailFields({
   density?: DetailDensity;
   layout?: DetailFieldLayout;
 }) {
+  const overlay = useOverlayContext();
   if (!items.length) return null;
   return (
-    <div className="@container/detail-fields min-w-0" data-detail-fields data-density={density} data-layout={layout}>
+    <div className="@container/detail-fields min-w-0" data-detail-fields data-density={density} data-layout={layout} data-compact-fields={overlay ? "true" : undefined}>
     <dl
       className={cn(
         "min-w-0",
@@ -118,6 +124,22 @@ export function DetailFields({
     </div>
   );
 }
+export function TechnicalDetails({ data, identifiers = [], title = "技术信息", children }: {
+  data: unknown;
+  identifiers?: ReadonlyArray<readonly [string, string | null]>;
+  title?: string;
+  children?: ReactNode;
+}) {
+  const [open, setOpen] = useState(false);
+  const trigger = useRef<HTMLButtonElement>(null);
+  return <div className="min-w-0" data-technical-information>
+    <Button ref={trigger} variant="ghost" size="sm" aria-haspopup="dialog" aria-expanded={open} onClick={() => setOpen(true)}>
+      {title}
+      <Code aria-hidden="true" data-icon="inline-end" />
+    </Button>
+    <TechnicalDetailsDialog open={open} onOpenChange={setOpen} finalFocus={() => trigger.current} data={data} identifiers={identifiers} title={title}>{children}</TechnicalDetailsDialog>
+  </div>;
+}
 export function DetailCredentials({ items, title = "凭据编号", headingLevel = 3 }: {
   items: ReadonlyArray<readonly [string, ReactNode]>;
   title?: string;
@@ -129,7 +151,7 @@ export function DetailCredentials({ items, title = "凭据编号", headingLevel 
   return <section className="flex min-w-0 flex-col gap-4" aria-labelledby={titleId} data-detail-credentials>
     <Separator />
     <Heading id={titleId} className="text-sm font-medium">{title}</Heading>
-    <DetailFields density="comfortable" items={items} />
+    <DetailFields density="comfortable" wide={items.map(([name]) => name)} items={items} />
   </section>;
 }
 export function TechnicalDetailsDialog({
@@ -138,49 +160,58 @@ export function TechnicalDetailsDialog({
   finalFocus,
   data,
   identifiers = [],
+  title: titleText = "技术详情",
+  children,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   finalFocus: () => HTMLElement | null;
   data: unknown;
   identifiers?: ReadonlyArray<readonly [string, string | null]>;
+  title?: string;
+  children?: ReactNode;
 }) {
   const title = useRef<HTMLHeadingElement>(null);
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
+    <Dialog presentation="dialog" open={open} onOpenChange={onOpenChange}>
       <DialogContent
         kind="technical"
-        className="flex max-h-[calc(100dvh-2rem)] flex-col sm:max-w-3xl"
+        backdropProps={{ forceRender: true }}
+        data-technical-dialog
+        showCloseButton={false}
         initialFocus={title}
         finalFocus={finalFocus}
       >
-        <DialogHeader className="shrink-0 pr-8">
+        <DialogHeader className="flex-row items-center justify-between gap-2 pr-0">
           <DialogTitle ref={title} tabIndex={-1}>
-            技术详情
+            {titleText}
           </DialogTitle>
+          <DialogClose render={<Button variant="ghost" size="icon" aria-label={"关闭" + titleText} />}><X /></DialogClose>
         </DialogHeader>
-        <div className="-mx-4 flex min-h-0 flex-col gap-4 overflow-auto px-4 pb-1">
+        <DialogBody>
+          {children}
           {identifiers.length > 0 && (
             <DetailFields
+              wide={identifiers.map(([name]) => name)}
               items={identifiers
                 .filter(
                   (entry): entry is readonly [string, string] => !!entry[1],
                 )
                 .map(([name, value]) => [
                   name,
-                  <CopyValue tooltip value={value} label={"复制" + name} />,
+                  <CopyValue value={value} label={"复制" + name} />,
                 ])}
             />
           )}
           <pre
             tabIndex={0}
-            aria-label="技术详情"
+            aria-label={titleText}
             role="group"
             className="shrink-0 rounded-md bg-muted p-4 text-xs whitespace-pre-wrap break-all"
           >
             {JSON.stringify(data, null, 2)}
           </pre>
-        </div>
+        </DialogBody>
         <DialogFooter className="shrink-0">
           <DialogClose render={<Button variant="outline" />}>关闭</DialogClose>
         </DialogFooter>
@@ -190,7 +221,7 @@ export function TechnicalDetailsDialog({
 }
 export function DetailLink({
   to,
-  label = "打开独立详情",
+  label = "查看详情",
 }: {
   to: string;
   label?: string;
@@ -218,17 +249,17 @@ export function OrderFacts({
   const basis = paymentBasisDescription("payment" in order ? order.payment.basis : order.payment_basis);
   if (density === "comfortable") return <Item className="items-start" data-detail-order-summary>
     <ItemContent className="min-w-0 gap-4">
-      <ItemHeader className={cn("flex-wrap items-start gap-3", layout === "flow" && "justify-start")}>
+      <ItemHeader className="flex-wrap items-baseline justify-start gap-x-3 gap-y-1">
         <ItemTitle className="line-clamp-none whitespace-normal wrap-anywhere" title={order.product_name}>
           {linked ? <Link to={"/orders/" + order.order_id}>{order.product_name}</Link> : order.product_name}
         </ItemTitle>
         <ItemActions><StatusBadge value={payment} /></ItemActions>
+        {basis && <span className="text-sm text-muted-foreground">{basis}</span>}
       </ItemHeader>
-      {basis && <p className="text-sm text-muted-foreground">{basis}</p>}
-      <DetailFields density="comfortable" layout={layout} wide={["商户订单号（业务网站）"]} items={[
+      <DetailFields density="comfortable" layout={layout} items={[
         ["应付金额", <ListMoney value={order.payable_amount_cents} label="应付金额" />],
         ["实收金额", <ListMoney value={order.received_amount_cents} label="实收金额" />],
-        ["所属网站", <Link to={"/sites/" + encodeURIComponent(order.api_client_id)}>{order.site_name ?? "名称不可用"}</Link>],
+        ["所属网站", <Link global to={"/sites/" + encodeURIComponent(order.api_client_id) + "/summary"}>{order.site_name ?? "名称不可用"}</Link>],
         ["创建时间", <ListDateTime value={order.created_at} inline />],
         ["商户订单号（业务网站）", <CopyValue value={order.merchant_order_no} label="复制商户订单号" />],
       ]} />
@@ -287,6 +318,7 @@ export function RelatedOrder({ orderId, density = "default", layout = "columns" 
         <OrderFacts order={query.data.data} density={density} layout={layout} />
       ) : null}
       <ErrorNotice
+        scope="page"
         error={query.error}
         retry={() => {
           void query.refetch();

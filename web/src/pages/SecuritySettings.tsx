@@ -1,11 +1,15 @@
 import { Link } from "@/navigation";
-import { AdminAccessSettings } from "./AdminAccessSettings";
 import { AdministratorSessions } from "@/components/administrator-sessions";
 import { DialogBody } from "@/components/admin-dialog";
+import { PageHeading } from "@/components/page-heading";
+import { SettingsSummary } from "@/components/settings-summary";
+import { OverlayFormActions } from "@/components/overlay-actions";
+import { useOverlayCloseGuard, useOverlayContext } from "@/lib/overlay-context";
 import { useSystemName } from "@/branding";
 import {
   useCallback,
   useEffect,
+  useId,
   useLayoutEffect,
   useRef,
   useState,
@@ -29,7 +33,6 @@ import { useDirtyDraft } from "@/drafts";
 import { CopyValue } from "@/components/copy-value";
 import { StatusBadge } from "@/components/business-status";
 import { ListDateTime } from "@/components/list-primitives";
-import { DetailCardGrid } from "@/components/detail/DetailCardGrid";
 import { ErrorNotice, Loading } from "@/components/request-state";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
@@ -48,7 +51,6 @@ import {
   CardTitle,
   CardDescription,
   CardContent,
-  CardFooter,
 } from "@/components/ui/card";
 import {
   Item,
@@ -110,8 +112,9 @@ export function SecuritySettings({
   const rotateTrigger = useRef<HTMLButtonElement | null>(null);
   return (
     <>
-      <DetailCardGrid className="security-settings-card-grid">
-        <AdminAccessSettings key="admin-access" settings={settings} onSaved={onSaved} />
+      <div className="flex min-w-0 flex-col gap-4" data-security-summary>
+        <SettingsSummary title="管理员 IP 白名单" rows={[["状态", settings.admin_access.enabled ? "已启用" : "未启用"], ["允许的 IP / 网段", settings.admin_access.cidrs.length + " 条规则"]]} editTo="/settings/security/access" />
+        <SettingsSummary title="登录密码" description="修改后所有设备都需重新登录。" rows={[["登录方式", "管理员密码"]]} editTo="/settings/security/password" editLabel="修改" />
         <Card key="secrets">
           <CardHeader>
             <CardTitle role="heading" aria-level={2}>
@@ -124,8 +127,9 @@ export function SecuritySettings({
           </CardHeader>
           <CardContent>
             {settings.site_mode && <Link to="/settings/accounts">在支付宝账号中管理应用密钥</Link>}
-            <ItemGroup className="record-list" data-density="compact" aria-label="密钥清单">
-                {secrets.filter(() => !settings.site_mode).map(([name, title, purpose]) => {
+            {!settings.site_mode && (
+              <ItemGroup className="record-list" data-density="compact" aria-label="密钥清单">
+                {secrets.map(([name, title, purpose]) => {
                   const metadata = settings.secrets[name];
                   if (!metadata) return null;
                   const status = (
@@ -220,12 +224,12 @@ export function SecuritySettings({
                     </Item>
                   );
                 })}
-            </ItemGroup>
+              </ItemGroup>
+            )}
           </CardContent>
         </Card>
-        <PasswordForm key="password" />
         <AdministratorSessions key="sessions" />
-      </DetailCardGrid>
+      </div>
       {reveal && (
         <SecretDialog
           finalFocus={() => dialogOrigin.current}
@@ -536,7 +540,13 @@ export function RotateKeyDialog({
   );
 }
 
+export function PasswordEditorPage() {
+  return <><PageHeading title="修改密码" /><PasswordForm /></>;
+}
+
 function PasswordForm() {
+  const overlay = useOverlayContext();
+  const formId = useId();
   const [password, setPassword] = useState("");
   const [confirmation, setConfirmation] = useState("");
   const [validation, setValidation] = useState<Error | null>(null);
@@ -568,6 +578,7 @@ function PasswordForm() {
       submitting.current = false;
     },
   });
+  useOverlayCloseGuard(() => submitting.current || change.isPending);
   function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (submitting.current || change.isPending) return;
@@ -597,12 +608,12 @@ function PasswordForm() {
   }
 
   return (
-    <form onSubmit={submit} className="min-w-0">
+    <form id={formId} onSubmit={submit} className="min-w-0">
       <Card>
         <CardHeader>
-          <CardTitle role="heading" aria-level={2}>
+          {!overlay && <CardTitle role="heading" aria-level={2}>
             修改密码
-          </CardTitle>
+          </CardTitle>}
           <CardDescription>修改后所有设备都需重新登录。</CardDescription>
         </CardHeader>
         <CardContent>
@@ -671,8 +682,10 @@ function PasswordForm() {
             </FieldGroup>
           </FieldSet>
         </CardContent>
-        <CardFooter className="justify-end">
+        <OverlayFormActions className="justify-end">
+          {overlay && <Button type="button" variant="outline" disabled={change.isPending} onClick={() => overlay.requestClose()}>取消</Button>}
           <Button
+            form={formId}
             type="submit"
             disabled={!password || !confirmation || change.isPending}
           >
@@ -683,7 +696,7 @@ function PasswordForm() {
             )}
             修改并重新登录
           </Button>
-        </CardFooter>
+        </OverlayFormActions>
       </Card>
     </form>
   );

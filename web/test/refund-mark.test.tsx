@@ -458,14 +458,16 @@ describe("administrator-only refund marks", () => {
         </MemoryRouter>
       </QueryClientProvider>,
     );
-    expect(await screen.findByText("PerPay 记录状态")).toBeVisible();
-    expect(screen.getAllByText("支出").length).toBeGreaterThan(0);
+    expect(await screen.findByText("支出")).toBeVisible();
+    const sources = await screen.findByRole("region", { name: /^采集记录/ });
+    expect(within(sources).getByText("PerPay 记录状态")).toBeVisible();
+    expect(screen.getByText("支出流水不关联收款订单。")).toBeVisible();
     expect(screen.queryByText(/支出仅作流水留存/)).not.toBeInTheDocument();
     expect(
       screen.queryByRole("button", { name: "人工关联收款" }),
     ).not.toBeInTheDocument();
     expect(
-      screen.queryByRole("heading", { name: "可能匹配的记录" }),
+      screen.queryByRole("heading", { name: /可能匹配的(?:记录|订单)/ }),
     ).not.toBeInTheDocument();
     expect(requests).toHaveLength(1);
     expect(

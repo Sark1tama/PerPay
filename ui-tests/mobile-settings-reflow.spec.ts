@@ -56,42 +56,52 @@ async function openAccountDraft(page: Page, manifest: Manifest, legacySection: "
   await page.goto(manifest.origin + "/admin/settings/" + legacySection);
   await expect(page).toHaveURL(manifest.origin + "/admin/settings/accounts");
   await page.getByRole("link", { name: "添加支付宝账号", exact: true }).click();
-  await expect(page).toHaveURL(manifest.origin + "/admin/settings/accounts/new");
+  await expect.poll(() => new URL(page.url()).searchParams.get("overlay")).toBe("/settings/accounts/new");
   await expect(page.locator("[data-alipay-account-editor]")).toBeVisible();
   return writes;
 }
 
-test.describe("narrow settings controls preserve their selected labels", () => {
+test.describe("narrow settings and overview controls remain usable", () => {
   test.use({ hasTouch: true, isMobile: true, viewport: { width: 320, height: 560 }, reducedMotion: "reduce" });
 
-  test("the account environment keeps both complete choices at 200% text after the legacy provider redirect", async ({ page, manifest }, info) => {
+  test("account configuration omits the environment selector and remains editable at 200% text after the legacy provider redirect", async ({ page, manifest }, info) => {
     await login(page, manifest);
     const writes = await openAccountDraft(page, manifest, "provider");
-    const environment = page.getByRole("combobox", { name: "支付宝环境", exact: true });
-    await expect(environment).toBeVisible();
+    await expect(page.getByRole("combobox", { name: "支付宝环境", exact: true })).toHaveCount(0);
     await page.evaluate(() => document.documentElement.style.fontSize = "200%");
-    const disclosure = page.getByRole("button", { name: "导入已有应用私钥", exact: true });
+    await page.getByRole("tab", { name: "应用信息", exact: true }).tap();
+    const disclosure = page.getByRole("button", { name: "导入已有应用私钥（可选）", exact: true });
     const disclosureGeometry = await completeButtonLabel(disclosure, page);
     await disclosure.tap();
     await expect(disclosure).toHaveAttribute("aria-expanded", "true");
-    await expect(page.getByRole("textbox", { name: "应用私钥", exact: true })).toBeVisible();
+    await expect(page.getByRole("textbox", { name: "应用私钥（可选）", exact: true })).toBeVisible();
     await disclosure.tap();
     await expect(disclosure).toHaveAttribute("aria-expanded", "false");
-    const values = [];
-    for (const name of ["沙箱环境", "生产环境"]) {
-      await environment.click();
-      await page.getByRole("option", { name, exact: true }).click();
-      await expect(environment.locator('[data-slot="select-value"]')).toHaveText(name);
-      values.push(await completeSelectValue(environment, page));
-    }
+    await page.getByRole("tab", { name: "基本信息", exact: true }).tap();
+    const name = page.getByRole("textbox", { name: "账号名称", exact: true });
+    const appId = page.getByRole("textbox", { name: "应用 ID（App ID）", exact: true });
+    await name.fill("主收款账号");
+    await page.getByRole("tab", { name: "应用信息", exact: true }).tap();
+    await appId.fill("202610300001");
+    await expect(appId).toHaveValue("202610300001");
+    await page.getByRole("tab", { name: "基本信息", exact: true }).tap();
+    await expect(name).toHaveValue("主收款账号");
+    const primaryGeometry = await completeButtonLabel(page.getByRole("button", { name: "保存并检查", exact: true }), page);
+    const more = page.getByRole("button", { name: "更多账号操作", exact: true });
+    const moreGeometry = await expectTouchTarget(more);
+    await more.tap();
+    await expect(page.getByRole("menuitem", { name: "保存草稿", exact: true })).toBeEnabled();
+    await page.keyboard.press("Escape");
+    await expect(more).toBeFocused();
     expect(writes).toEqual([]);
-    await record(page, info, { evidence: "real account draft form with desktop browser touch emulation; no account submitted", rootFont: 200, accountEnvironmentValues: values, disclosureGeometry, legacyRedirect: "provider", writes });
+    await record(page, info, { evidence: "real account draft form with desktop browser touch emulation; no account submitted", rootFont: 200, disclosureGeometry, primaryGeometry, moreGeometry, legacyRedirect: "provider", writes });
   });
 
   test("a delayed text reflow keeps the account disclosure fully reachable after the legacy collection redirect", async ({ page, manifest }, info) => {
     await login(page, manifest);
     const writes = await openAccountDraft(page, manifest, "collection");
-    const disclosure = page.getByRole("button", { name: "导入已有应用私钥", exact: true });
+    await page.getByRole("tab", { name: "应用信息", exact: true }).tap();
+    const disclosure = page.getByRole("button", { name: "导入已有应用私钥（可选）", exact: true });
     await expect(disclosure).toBeVisible();
     await page.evaluate(() => {
       window.setTimeout(() => document.documentElement.style.fontSize = "200%", 50);
@@ -102,25 +112,32 @@ test.describe("narrow settings controls preserve their selected labels", () => {
     await expect(page.locator("html")).toHaveCSS("font-size", "32px");
     await disclosure.tap();
     await expect(disclosure).toHaveAttribute("aria-expanded", "true");
-    await expect(page.getByRole("textbox", { name: "应用私钥", exact: true })).toBeVisible();
+    await expect(page.getByRole("textbox", { name: "应用私钥（可选）", exact: true })).toBeVisible();
     expect(writes).toEqual([]);
     await record(page, info, { evidence: "real account draft form with desktop browser touch emulation; no account submitted", rootFont: 200, delayedReflow: true, disclosureGeometry: geometry, legacyRedirect: "collection", writes });
   });
 
   for (const font of [100, 200]) {
-    test(`chart style choices preserve complete labels and keyboard selection at ${font}% text`, async ({ page, manifest }, info) => {
+    test(`overview chart choices preserve accessible touch targets and keyboard selection at ${font}% text`, async ({ page, manifest }, info) => {
       await login(page, manifest);
-      await page.goto(manifest.origin + "/admin/settings/display");
-      const group = page.getByRole("group", { name: "首页图表样式", exact: true });
+      const group = page.getByRole("group", { name: "图表类型", exact: true });
       await expect(group).toBeVisible();
       await page.evaluate(font => document.documentElement.style.fontSize = font + "%", font);
       const values = [];
       for (const [name, value] of [["面积图", "AREA"], ["柱状图", "BAR"], ["折线图", "LINE"]] as const) {
         const choice = group.getByRole("button", { name, exact: true });
-        const geometry = await completeButtonLabel(choice, page);
+        await expect(choice).toHaveAccessibleName(name);
+        await expect(choice).not.toContainText(name);
+        await choice.scrollIntoViewIfNeeded();
+        await page.clock.runFor(100);
+        // The outer rounded corners are transparent; target size, edge
+        // midpoints and the real tap below still verify usable touch areas.
+        const geometry = await expectTouchTarget(choice, { hitTest: false });
+        expect([1, 3, 4, 5, 7].every(index => geometry.points[index]!.hit), "the button center and four edge midpoints belong to that control").toBe(true);
+        await expect(choice.locator("svg")).toBeVisible();
         await choice.tap();
         await expect(choice).toHaveAttribute("aria-pressed", "true");
-        await expect(page.locator('input[name="dashboard_chart_type"]')).toHaveValue(value);
+        await expect(page.locator(".trend-plot[data-chart-type]")).toHaveAttribute("data-chart-type", value);
         values.push({ name, value, geometry });
       }
       const layout = await group.evaluate(element => {
@@ -133,8 +150,7 @@ test.describe("narrow settings controls preserve their selected labels", () => {
       });
       expect(layout.scrollWidth).toBeLessThanOrEqual(layout.width + 1);
       expect(layout.choices.every(choice => choice.left >= -1 && choice.right <= layout.width + 1)).toBe(true);
-      expect(new Set(layout.choices.map(choice => Math.round(choice.top))).size, "the joined group keeps a horizontal row").toBe(1);
-      await expect(group).toHaveAttribute("data-spacing", "0");
+      expect(new Set(layout.choices.map(choice => Math.round(choice.top))).size, "the chart choices keep a horizontal row").toBe(1);
       await expect(group).toHaveAttribute("data-orientation", "horizontal");
       const first = group.getByRole("button", { name: "面积图", exact: true });
       await first.tap();
@@ -142,17 +158,19 @@ test.describe("narrow settings controls preserve their selected labels", () => {
       await page.keyboard.press("ArrowRight");
       const next = group.getByRole("button", { name: "柱状图", exact: true });
       await expect(next).toBeFocused();
+      await page.clock.runFor(100);
+      await expect(page.getByRole("tooltip")).toContainText("柱状图");
       await page.keyboard.press("Space");
       await expect(next).toHaveAttribute("aria-pressed", "true");
-      await expect(page.locator('input[name="dashboard_chart_type"]')).toHaveValue("BAR");
-      await record(page, info, { evidence: "desktop browser touch emulation", rootFont: font, chartStyleChoices: values, layout });
+      await expect(page.locator(".trend-plot[data-chart-type]")).toHaveAttribute("data-chart-type", "BAR");
+      await record(page, info, { evidence: "desktop browser touch emulation", rootFont: font, overviewChartChoices: values, layout });
     });
   }
 
   for (const [font, textSpacing] of [[200, false], [100, true]] as const) {
     test(`backup units remain complete and preserve the interval at ${font}% text, spacing=${textSpacing}`, async ({ page, manifest }, info) => {
       await login(page, manifest);
-      await page.goto(manifest.origin + "/admin/settings/backup");
+      await page.goto(manifest.origin + "/admin/settings/backup/edit");
       const units = page.getByRole("combobox", { name: "备份间隔单位", exact: true });
       const amount = page.getByRole("spinbutton", { name: "备份间隔", exact: true });
       await expect(units).toBeVisible();

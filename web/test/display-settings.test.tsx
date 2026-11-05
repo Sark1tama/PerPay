@@ -1,36 +1,42 @@
 import { QueryClientProvider } from "@tanstack/react-query";
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router";
 import { describe, expect, it, vi } from "vitest";
-import { queryClient } from "../src/api/client";
+import { queryClient, type RuntimeSettings } from "../src/api/client";
 import { SettingsEditor } from "../src/components/SettingsForms";
 import { apiError, json, settings } from "./fixtures";
 
-function mount(onSaved = vi.fn()) {
-  render(
+function mount(currentSettings: RuntimeSettings = settings) {
+  const onSaved = vi.fn();
+  const editor = (current: RuntimeSettings) => (
     <QueryClientProvider client={queryClient}>
       <MemoryRouter>
         <SettingsEditor
           section="display"
-          settings={settings}
+          settings={current}
           onSaved={onSaved}
         />
       </MemoryRouter>
-    </QueryClientProvider>,
+    </QueryClientProvider>
   );
-  return onSaved;
+  const view = render(editor(currentSettings));
+  return { onSaved, updateSettings: (current: RuntimeSettings) => view.rerender(editor(current)) };
 }
 
 describe("instance display settings", () => {
-  it("keeps only field labels and controls without redundant headings or descriptions", () => {
+  it("keeps the display fields together and exposes the same chart default as the settings summary", () => {
     mount();
     const name = screen.getByRole("textbox", { name: "支付系统名称" });
     expect(name).toHaveAttribute("required");
     expect(name).toHaveAttribute("maxlength", "40");
     expect(name).not.toHaveAttribute("aria-describedby");
     expect(screen.getByRole("switch", { name: "收银台显示商品名称" })).toBeVisible();
-    expect(screen.getByRole("group", { name: "首页图表样式" })).toBeVisible();
+    expect(screen.getByRole("textbox", { name: "商家帮助链接" })).toBeVisible();
+    const chart = screen.getByRole("group", { name: "收款趋势默认图形" });
+    expect(within(chart).getByRole("button", { name: "面积图" })).toHaveAttribute("aria-pressed", "true");
+    expect(within(chart).getByRole("button", { name: "柱状图" })).toHaveAttribute("aria-pressed", "false");
+    expect(within(chart).getByRole("button", { name: "折线图" })).toHaveAttribute("aria-pressed", "false");
     const form = name.closest("form")!;
     expect(form).toHaveClass("w-full");
     expect(form).not.toHaveClass("max-w-2xl");
@@ -43,9 +49,11 @@ describe("instance display settings", () => {
       expect(row).not.toContainElement(row.querySelector("label input"));
     }
     expect(rows[0]).toContainElement(name);
-    expect(rows[2]).toContainElement(screen.getByRole("group", { name: "首页图表样式" }));
+    expect(rows[1]).toContainElement(chart);
+    expect(rows[2]).toContainElement(screen.getByRole("textbox", { name: "商家帮助链接" }));
     expect(rows[3]).toContainElement(screen.getByRole("switch", { name: "收银台显示商品名称" }));
-    expect(form.querySelector('[data-slot="field-description"]')).toBeNull();
+    expect(new FormData(form).get("dashboard_chart_type")).toBe("AREA");
+    expect(chart).toHaveAccessibleDescription("用于未设置个人图形偏好的浏览器。");
     expect(form.querySelector('[data-slot="card-header"]')).toHaveClass("sr-only");
     expect(form.querySelector('[data-slot="field-legend"]')).toHaveClass("sr-only");
     expect(screen.queryByText("系统名称", { exact: true })).not.toBeInTheDocument();
@@ -53,14 +61,25 @@ describe("instance display settings", () => {
     expect(screen.queryByText("收款概览", { exact: true })).not.toBeInTheDocument();
   });
 
-  it("persists both settings with the latest revision, without saving on selection", async () => {
+  it("saves display drafts with the latest revision and preserves the server chart default", async () => {
     const requests: Request[] = [];
-    const saved = {
+    const initial: RuntimeSettings = {
       ...settings,
-      revision: settings.revision + 1,
+      display: { ...settings.display, dashboard_chart_type: "BAR" },
+    };
+    const latest: RuntimeSettings = {
+      ...initial,
+      revision: settings.revision + 2,
+      display: { ...initial.display, dashboard_chart_type: "LINE" },
+    };
+    const saved = {
+      ...latest,
+      revision: latest.revision + 1,
       display: {
+        ...latest.display,
+        system_name: "测试支付",
+        checkout_help_url: "https://support.example/help",
         checkout_show_product_name: false,
-        dashboard_chart_type: "BAR" as const,
       },
     };
     vi.stubGlobal(
@@ -70,21 +89,23 @@ describe("instance display settings", () => {
         return json({ data: saved });
       }),
     );
-    const onSaved = mount();
+    const { onSaved, updateSettings } = mount(initial);
     const user = userEvent.setup();
     expect(
       screen.getByRole("switch", { name: "收银台显示商品名称" }),
     ).toBeChecked();
     expect(screen.getByRole("button", { name: "保存" })).toBeDisabled();
+    const name = screen.getByRole("textbox", { name: "支付系统名称" });
+    await user.clear(name);
+    await user.type(name, "测试支付");
+    await user.type(screen.getByRole("textbox", { name: "商家帮助链接" }), "https://support.example/help");
     await user.click(
       screen.getByRole("switch", { name: "收银台显示商品名称" }),
     );
-    await user.click(screen.getByRole("button", { name: "柱状图" }));
-    expect(screen.getByRole("button", { name: "柱状图" })).toHaveAttribute(
-      "aria-pressed",
-      "true",
-    );
     expect(requests).toHaveLength(0);
+    updateSettings(latest);
+    expect(name).toHaveValue("测试支付");
+    expect(screen.getByRole("textbox", { name: "商家帮助链接" })).toHaveValue("https://support.example/help");
     await user.click(screen.getByRole("button", { name: "保存" }));
     await waitFor(() => expect(onSaved).toHaveBeenCalledWith(saved));
     expect(requests).toHaveLength(1);
@@ -92,13 +113,53 @@ describe("instance display settings", () => {
       "/api/admin/v1/settings/display",
     );
     expect(await requests[0]!.json()).toEqual({
-      system_name: "PerPay",
-      checkout_help_url: null,
-      revision: settings.revision,
+      system_name: "测试支付",
+      checkout_help_url: "https://support.example/help",
+      revision: latest.revision,
       checkout_show_product_name: false,
-      dashboard_chart_type: "BAR",
+      dashboard_chart_type: "LINE",
     });
+    expect(screen.getByRole("button", { name: "折线图" })).toHaveAttribute("aria-pressed", "true");
     expect(screen.queryByText("未保存")).not.toBeInTheDocument();
+  });
+
+  it("keeps a selected chart as a draft, restores a clean default, and saves only the explicit selection", async () => {
+    const requests: Request[] = [];
+    const saved: RuntimeSettings = { ...settings, revision: settings.revision + 1,
+      display: { ...settings.display, dashboard_chart_type: "BAR" } };
+    vi.stubGlobal("fetch", vi.fn(async (request: Request) => { requests.push(request); return json({ data: saved }); }));
+    const { onSaved } = mount();
+    const user = userEvent.setup();
+    const chart = screen.getByRole("group", { name: "收款趋势默认图形" });
+    await user.click(within(chart).getByRole("button", { name: "柱状图" }));
+    expect(screen.getByText("未保存")).toBeVisible();
+    expect(requests).toHaveLength(0);
+    await user.click(within(chart).getByRole("button", { name: "面积图" }));
+    expect(screen.getByRole("button", { name: "保存" })).toBeDisabled();
+    expect(screen.queryByText("未保存")).not.toBeInTheDocument();
+    await user.click(within(chart).getByRole("button", { name: "柱状图" }));
+    await user.click(screen.getByRole("button", { name: "保存" }));
+    await waitFor(() => expect(onSaved).toHaveBeenCalledWith(saved));
+    expect(requests).toHaveLength(1);
+    expect(await requests[0]!.json()).toMatchObject({ revision: settings.revision, dashboard_chart_type: "BAR" });
+    expect(screen.getByRole("button", { name: "保存" })).toBeDisabled();
+  });
+
+  it("preserves an explicitly edited chart when the settings revision and remote default change", async () => {
+    const requests: Request[] = [];
+    const latest: RuntimeSettings = { ...settings, revision: settings.revision + 2,
+      display: { ...settings.display, dashboard_chart_type: "LINE" } };
+    const saved: RuntimeSettings = { ...latest, revision: latest.revision + 1,
+      display: { ...latest.display, dashboard_chart_type: "BAR" } };
+    vi.stubGlobal("fetch", vi.fn(async (request: Request) => { requests.push(request); return json({ data: saved }); }));
+    const { onSaved, updateSettings } = mount();
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: "柱状图" }));
+    updateSettings(latest);
+    expect(screen.getByRole("button", { name: "柱状图" })).toHaveAttribute("aria-pressed", "true");
+    await user.click(screen.getByRole("button", { name: "保存" }));
+    await waitFor(() => expect(onSaved).toHaveBeenCalledWith(saved));
+    expect(await requests[0]!.json()).toMatchObject({ revision: latest.revision, dashboard_chart_type: "BAR" });
   });
 
   it("recognizes restored defaults without making a request", async () => {
@@ -108,35 +169,41 @@ describe("instance display settings", () => {
     const user = userEvent.setup();
     const checkbox = screen.getByRole("switch", { name: "收银台显示商品名称" });
     await user.click(checkbox);
+    expect(screen.getByText("未保存")).toBeVisible();
     await user.click(checkbox);
-    await user.click(screen.getByRole("button", { name: "折线图" }));
-    await user.click(screen.getByRole("button", { name: "面积图" }));
+    const name = screen.getByRole("textbox", { name: "支付系统名称" });
+    await user.clear(name);
+    await user.type(name, "新的支付");
+    expect(screen.getByRole("button", { name: "保存" })).toBeEnabled();
+    await user.clear(name);
+    await user.type(name, "PerPay");
     expect(screen.getByRole("button", { name: "保存" })).toBeDisabled();
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it("retains the selected display settings after a concurrent-save conflict", async () => {
+  it("retains the display draft after a concurrent-save conflict", async () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(async () =>
         apiError("settings_revision_conflict", "configuration changed"),
       ),
     );
-    const onSaved = mount();
+    const { onSaved } = mount();
     const user = userEvent.setup();
+    const name = screen.getByRole("textbox", { name: "支付系统名称" });
+    await user.clear(name);
+    await user.type(name, "尚未保存的名称");
     await user.click(
       screen.getByRole("switch", { name: "收银台显示商品名称" }),
     );
-    await user.click(screen.getByRole("button", { name: "折线图" }));
+    await user.click(screen.getByRole("button", { name: "柱状图" }));
     await user.click(screen.getByRole("button", { name: "保存" }));
     await screen.findByRole("alert");
     expect(
       screen.getByRole("switch", { name: "收银台显示商品名称" }),
     ).not.toBeChecked();
-    expect(screen.getByRole("button", { name: "折线图" })).toHaveAttribute(
-      "aria-pressed",
-      "true",
-    );
+    expect(name).toHaveValue("尚未保存的名称");
+    expect(screen.getByRole("button", { name: "柱状图" })).toHaveAttribute("aria-pressed", "true");
     expect(screen.getByText("未保存")).toBeVisible();
     expect(onSaved).not.toHaveBeenCalled();
   });

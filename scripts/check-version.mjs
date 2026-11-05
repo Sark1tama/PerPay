@@ -23,6 +23,8 @@ const versionSchemaMaximum = Object.freeze({
   "1.0.0-alpha.2.fork.2": 38,
   "1.0.0-rc.1": 38,
   "1.0.0-rc.1.fork.1": 39,
+  "1.0.0-rc.2": 39,
+  "1.0.0-rc.2.fork.1": 40,
 });
 
 export function inspectVersionFiles(root, requestedTag) {

@@ -20,6 +20,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { cn } from "@/lib/utils";
 
 export function SitePolicyFields({
   value,
@@ -173,6 +174,7 @@ export function SitePolicyFields({
           <FieldLegend className={section ? "sr-only" : undefined}>收银台展示</FieldLegend>
           <SiteTextField
             label="收银台名称"
+            fullWidth
             required
             maxLength={40}
             error={error("display.checkout_name")}
@@ -364,6 +366,7 @@ export function SiteTextField({
   maxLength,
   type = "text",
   placeholder,
+  fullWidth = false,
 }: {
   label: string;
   value: string;
@@ -373,6 +376,7 @@ export function SiteTextField({
   maxLength?: number;
   type?: "text" | "url";
   placeholder?: string;
+  fullWidth?: boolean;
 }) {
   const id = useId(),
     errorId = id + "-error";
@@ -381,7 +385,7 @@ export function SiteTextField({
   const fieldError = error || (requiredChecked && missingRequired ? `请输入${label}。` : undefined);
   return (
     <Field
-      className={type === "text" ? "max-w-md" : undefined}
+      className={cn(type === "text" && !fullWidth && "max-w-md")}
       data-invalid={!!fieldError}
     >
       <FieldLabel htmlFor={id}>{label}</FieldLabel>

@@ -167,17 +167,25 @@ test.describe("compact mobile button visuals and separate touch targets", () => 
     });
   }
 
-  test("joined choices keep their touch regions inside each horizontal slot", async ({ page, manifest }, info) => {
+  test("overview chart choices keep their touch regions inside each horizontal slot", async ({ page, manifest }, info) => {
     await login(page, manifest);
-    await page.goto(manifest.origin + "/admin/settings/display");
-    const group = page.getByRole("group", { name: "首页图表样式", exact: true });
+    const group = page.getByRole("group", { name: "图表类型", exact: true });
+    await expect(group).toBeVisible();
+    // The controls precede their analytics and metric cards. Finish that
+    // shared layout before scrolling them into the viewport for hit testing.
+    await expect(page.locator(".trend-card")).toHaveAttribute("aria-busy", "false");
+    await page.evaluate(() => document.fonts.ready);
+    await group.scrollIntoViewIfNeeded();
+    await page.clock.runFor(100);
     const choices = ["面积图", "柱状图", "折线图"].map(name => group.getByRole("button", { name, exact: true }));
     const geometry = [];
     for (const choice of choices) {
-      const target = await expectTouchTarget(choice);
-      expect(target.visual.height).toBeCloseTo(40, 1);
-      expect(target.x).toBeCloseTo(target.visual.x, 1);
-      expect(target.width).toBeCloseTo(target.visual.width, 1);
+      // Group ends have transparent rounded corners; verify their full target
+      // size and the center/edge midpoints on the actual control surface.
+      const target = await expectTouchTarget(choice, { hitTest: false });
+      expect([1, 3, 4, 5, 7].every(index => target.points[index]!.hit), "the button center and four edge midpoints belong to that control").toBe(true);
+      expect(target.x).toBeGreaterThanOrEqual(target.slot.x - .5);
+      expect(target.x + target.width).toBeLessThanOrEqual(target.slot.x + target.slot.width + .5);
       for (const x of [target.visual.x + 2, target.visual.x + target.visual.width - 2]) {
         expect(await choice.evaluate((element, point) => {
           const hit = document.elementFromPoint(point.x, point.y);
@@ -194,9 +202,8 @@ test.describe("compact mobile button visuals and separate touch targets", () => 
     await record(page, info, { evidence: "browser touch viewport", joinedChoices: geometry });
   });
 
-  test("the first technical-detail copy action retains its full touch target at the scroll start", async ({ page, manifest }, info) => {
-    // The retired global secret dialog is no longer reachable. Exercise the
-    // same shared CopyValue control in a real synthetic ledger detail dialog.
+  test("the first technical copy action retains its full touch target in the independent reader", async ({ page, manifest }, info) => {
+    // The parent record keeps its geometry while the reader owns the scroll area.
     await page.addInitScript(() => {
       Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText: async (value: string) => {
         (window as Window & { __copiedText?: string }).__copiedText = value;
@@ -204,36 +211,143 @@ test.describe("compact mobile button visuals and separate touch targets", () => 
     });
     await login(page, manifest);
     await page.goto(manifest.origin + "/admin" + manifest.details.ledgerAssociated);
-    const view = page.getByRole("button", { name: "更多操作，支付宝流水记录操作", exact: true });
-    await view.click();
-    await page.getByRole("menuitem", { name: "技术详情", exact: true }).click();
-    const dialog = page.getByRole("dialog", { name: "技术详情", exact: true });
-    const body = dialog.locator("[data-admin-dialog-scroll]");
-    await expect.poll(() => body.evaluate(element => element.scrollTop)).toBe(0);
-    const copy = dialog.getByRole("button", { name: "复制内部流水编号（PerPay）", exact: true });
-    await expect(dialog.getByRole("heading", { name: "技术详情", exact: true })).toBeFocused();
+    await expect.poll(() => new URL(page.url()).searchParams.get("overlay")).toBe(manifest.details.ledgerAssociated);
+    const sourceUrl = page.url();
+    const dialog = page.locator("[data-overlay-content]");
+    await expect(dialog.locator('[data-detail-section="transaction"]')).toBeVisible();
+    await expect(dialog.getByRole("tablist")).toHaveCount(0);
+    const technical = dialog.locator('[data-detail-section="transaction"] [data-ledger-summary] [data-technical-information]');
+    const view = technical.locator('button[aria-haspopup="dialog"]');
+    await view.scrollIntoViewIfNeeded();
+    await view.focus();
+    const parentBefore = await dialog.evaluate(element => ({ height: element.getBoundingClientRect().height, top: element.getBoundingClientRect().top, scrollTop: element.querySelector('[data-overlay-detail]')!.scrollTop }));
+    await page.keyboard.press("Enter");
+    await expect(view).toHaveAttribute("aria-expanded", "true");
+    const reader = page.getByRole("dialog", { name: "技术信息", exact: true });
+    await expect(reader.locator('pre[aria-label="技术信息"]')).toBeVisible();
+    const body = reader.locator(":scope > [data-admin-dialog-body]");
+    await expect(body).toHaveCSS("overflow-y", "auto");
+    await body.evaluate(element => element.scrollTop = 0);
+    const sectionStart = await body.evaluate(element => ({
+      scrollTop: element.scrollTop,
+      bodyTop: element.getBoundingClientRect().top,
+    }));
+    expect(sectionStart.scrollTop).toBe(0);
+    const copy = reader.getByRole("button", { name: "复制内部流水编号（PerPay）", exact: true });
+    await expect(reader.getByRole("heading", { name: "技术信息", exact: true })).toBeFocused();
+    await page.keyboard.press("Tab");
+    await expect(reader.getByRole("button", { name: "关闭技术信息", exact: true })).toBeFocused();
     await page.keyboard.press("Tab");
     await expect(copy).toBeFocused();
+    await expect(copy).toHaveAccessibleName("复制内部流水编号（PerPay）");
+    await expect(copy).toHaveAttribute("title", "复制内部流水编号（PerPay）");
     await copy.hover();
     await page.clock.runFor(200);
-    const tooltip = page.locator('[data-slot="tooltip-content"]').filter({ hasText: /^复制内部流水编号（PerPay）$/ });
-    await expect(tooltip).toBeVisible();
+    // The copy action uses its native title; no custom tooltip covers
+    // its touch extension. The complete surface is still probed below.
+    await expect(page.locator('[data-slot="tooltip-content"]:visible')).toHaveCount(0);
     const copyGeometry = await expectTouchSlot(copy);
-    const tooltipBounds = (await tooltip.boundingBox())!;
-    const overlapWidth = Math.min(copyGeometry.x + copyGeometry.width, tooltipBounds.x + tooltipBounds.width) - Math.max(copyGeometry.x, tooltipBounds.x);
-    const overlapHeight = Math.min(copyGeometry.y + copyGeometry.height, tooltipBounds.y + tooltipBounds.height) - Math.max(copyGeometry.y, tooltipBounds.y);
-    expect(overlapWidth <= 0 || overlapHeight <= 0, "the open tooltip stays outside the complete 40px copy touch target").toBe(true);
     expect(copyGeometry.visual.height).toBeCloseTo(32, 1);
     const bodyBox = (await body.boundingBox())!;
     expect(copyGeometry.y).toBeGreaterThanOrEqual(bodyBox.y);
+    expect(await reader.evaluate(element => element.scrollTop), "the reader shell remains stationary while its body scrolls").toBe(0);
     const copyTap = await tapOutsideVisible(page, copy, "top");
-    await expect(dialog.getByRole("status").filter({ hasText: "已复制" })).toHaveText("已复制");
+    await expect(copy).toBeFocused();
+    await expect(reader.getByRole("status").filter({ hasText: "已复制" })).toHaveText("已复制");
     expect(await page.evaluate(() => (window as Window & { __copiedText?: string }).__copiedText)).toBe(manifest.details.ledgerAssociated!.split("/").at(-1));
-    await record(page, info, { evidence: "real ledger technical dialog with synthetic domain data and clipboard", buttonScale: { copyGeometry, copyTap, tooltipBounds } });
-    await dialog.getByRole("button", { name: "关闭", exact: true }).click();
-    await expect(dialog).toHaveCount(0);
+    await record(page, info, { evidence: "real ledger overlay with independent technical dialog, synthetic domain data and clipboard", buttonScale: { copyGeometry, copyTap, sectionStart, nativeTitle: true } });
+    await page.keyboard.press("Escape");
+    await expect(reader).toHaveCount(0);
+    await expect(view).toHaveAttribute("aria-expanded", "false");
+    await expect(technical.locator("pre")).toHaveCount(0);
     await expect(view).toBeFocused();
+    await expect(page.getByRole("dialog")).toHaveCount(1);
+    expect(await dialog.evaluate(element => ({ height: element.getBoundingClientRect().height, top: element.getBoundingClientRect().top, scrollTop: element.querySelector('[data-overlay-detail]')!.scrollTop }))).toEqual(parentBefore);
+    await expect(page).toHaveURL(sourceUrl);
   });
+
+  for (const width of [320, 390, 430]) {
+    test(`${width}px: short chart, reminder and settings choices keep compact visuals without stretching`, async ({ page, manifest }, info) => {
+      await page.setViewportSize({ width, height: 900 });
+      await login(page, manifest);
+      const card = page.locator(".trend-card");
+      const tabs = card.getByRole("tablist", { name: "收款趋势视图", exact: true });
+      await expect(tabs).toBeVisible();
+      const tabsBox = (await tabs.boundingBox())!;
+      expect(tabsBox.height).toBeCloseTo(40, 1);
+      expect(tabsBox.width).toBeLessThan(180);
+      for (const name of ["图表", "每日数据"]) {
+        const target = tabs.getByRole("tab", { name, exact: true });
+        expect((await centered(target, page)).visual.height).toBeCloseTo(32, 1);
+      }
+      await tabs.getByRole("tab", { name: "每日数据", exact: true }).tap();
+      await expect(card.getByRole("region", { name: "每日数据", exact: true })).toBeVisible();
+      await tabs.getByRole("tab", { name: "图表", exact: true }).tap();
+      const types = card.getByRole("group", { name: "图表类型", exact: true });
+      const typeGeometry = [];
+      for (const [name, value] of [["面积图", "AREA"], ["柱状图", "BAR"], ["折线图", "LINE"]] as const) {
+        const target = types.getByRole("button", { name, exact: true });
+        const geometry = await centered(target, page);
+        expect(geometry.visual.width).toBeCloseTo(32, 1);
+        expect(geometry.visual.height).toBeCloseTo(32, 1);
+        typeGeometry.push(geometry);
+        await tapOutsideVisible(page, target, "top");
+        await expect(card.locator('[data-slot="chart"]')).toHaveAttribute("data-chart-type", value);
+      }
+      await expectTouchGap(types.getByRole("button", { name: "面积图", exact: true }), types.getByRole("button", { name: "柱状图", exact: true }), "horizontal");
+      await record(page, info, { compactChoices: "trend", width, tabsBox, typeGeometry });
+      if (width === 320) {
+        await page.evaluate(() => document.documentElement.style.fontSize = "200%");
+        await page.clock.runFor(100);
+        expect((await tabs.boundingBox())!.height).toBeLessThanOrEqual(80);
+        for (const name of ["图表", "每日数据"]) {
+          const label = await tabs.getByRole("tab", { name, exact: true }).evaluate(element => {
+            const bounds = element.getBoundingClientRect();
+            const range = document.createRange();
+            range.selectNodeContents(element);
+            const lines = [...range.getClientRects()].filter(line => line.width && line.height);
+            return {
+              lineCount: new Set(lines.map(line => Math.round(line.top))).size,
+              contained: lines.every(line => line.left >= bounds.left - 1 && line.right <= bounds.right + 1 && line.top >= bounds.top - 1 && line.bottom <= bounds.bottom + 1),
+            };
+          });
+          expect(label.lineCount, `${name} remains a complete label at doubled text`).toBe(1);
+          expect(label.contained).toBe(true);
+        }
+        await record(page, info, { compactChoices: "trend-doubled-text", width });
+      }
+
+      await page.goto(manifest.origin + "/admin/work-items");
+      const range = page.locator("[data-list-mobile-leading]").getByRole("group", { name: "显示范围", exact: true });
+      await expect(range).toBeVisible();
+      const rangeBox = (await range.boundingBox())!;
+      expect(rangeBox.width).toBeLessThan(200);
+      for (const name of ["待处理", "已忽略"]) {
+        const target = range.getByRole("button", { name, exact: true });
+        expect((await centered(target, page)).visual.height).toBeCloseTo(32, 1);
+        await target.tap();
+        await expect(target).toHaveAttribute("aria-pressed", "true");
+      }
+      await record(page, info, { compactChoices: "work-items", width, rangeBox });
+
+      await page.goto(manifest.origin + "/admin/settings/display");
+      await page.getByRole("link", { name: "编辑界面显示", exact: true }).click();
+      const editor = page.locator("[data-overlay-content]");
+      const defaults = editor.getByRole("group", { name: "收款趋势默认图形", exact: true });
+      const defaultGeometry = [];
+      for (const name of ["面积图", "柱状图", "折线图"]) {
+        const target = defaults.getByRole("button", { name, exact: true });
+        const geometry = await centered(target, page);
+        expect(geometry.visual.height).toBeCloseTo(32, 1);
+        expect(geometry.visual.width).toBeLessThan(120);
+        defaultGeometry.push(geometry);
+        await target.tap();
+        await expect(target).toHaveAttribute("aria-pressed", "true");
+      }
+      expect(Math.max(...defaultGeometry.map(geometry => geometry.visual.y)) - Math.min(...defaultGeometry.map(geometry => geometry.visual.y))).toBeLessThanOrEqual(1);
+      await record(page, info, { compactChoices: "display-default", width, defaultGeometry });
+    });
+  }
 
   test("200% text retains complete scrollable touch targets without fixed visual-size assertions", async ({ page, manifest }, info) => {
     await page.setViewportSize({ width: 320, height: 560 });

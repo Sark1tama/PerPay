@@ -201,7 +201,7 @@ describe("authoritative verification failure after an unknown response", () => {
     let attempts = 0;
     const view = mountOnboarding({
       pendingKey: true,
-      path: "/settings/provider",
+      path: "/settings/provider/edit",
       handle: (request) => {
         if (!request.url.endsWith("/actions/activate")) return undefined;
         attempts++;
@@ -272,7 +272,7 @@ describe("authoritative verification failure after an unknown response", () => {
       let attempts = 0;
       const view = mountOnboarding({
         pendingKey: true,
-        path: "/settings/provider",
+        path: "/settings/provider/edit",
         handle: (request) => {
           if (!request.url.endsWith("/actions/activate")) return undefined;
           attempts++;
@@ -309,7 +309,7 @@ describe("authoritative verification failure after an unknown response", () => {
 
 describe.each([
   ["onboarding", applicationPath],
-  ["regular settings", "/settings/provider"],
+  ["regular settings", "/settings/provider/edit"],
 ] as const)("key operation completion feedback in %s", (_name, path) => {
   it.each([
     [
@@ -342,7 +342,9 @@ describe.each([
         );
       if (!inline)
         await user.click(await screen.findByRole("button", { name: trigger }));
-      const dialog = await screen.findByRole(inline ? "form" : trigger === "更换应用密钥对" ? "alertdialog" : "dialog");
+      const dialog = await screen.findByRole(inline ? "form" : trigger === "更换应用密钥对" ? "alertdialog" : "dialog", {
+        name: trigger === "更换应用密钥对" ? "更换应用密钥对？" : trigger === "验证并启用" ? "验证并启用新应用公钥" : "放弃新公钥？",
+      });
       if (trigger === "验证并启用")
         await user.type(
           within(dialog).getByLabelText("支付宝公钥"),

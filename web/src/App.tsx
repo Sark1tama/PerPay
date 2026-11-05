@@ -2,12 +2,13 @@ import { WorkspaceProvider, WorkspaceNavigationProvider, WorkspaceOutlet, useWor
 import { workspaceScope } from "@/lib/workspace-scope";
 import { isReadableDetailPage } from "@/lib/detail-layout";
 import { prepareWorkspaceNavigation } from "@/lib/workspace-navigation";
+import { OVERLAY_PARAMETER, readOverlayTarget } from "@/lib/overlay-navigation";
 import { AdminContent, ContentWidthProvider } from "@/components/content-width";
 import { PageHeaderActionsProvider } from "@/components/page-header-actions";
 import { ListDensityProvider } from "@/components/list-density";
 import { PageHeading, PageHeadingProvider, PageHeadingSlot } from "@/components/page-heading";
 import { useSystemName } from "@/branding";
-import { SystemStatusBoundary } from "@/features/system-status";
+import { SystemStatusBoundary, useSystemStatus } from "@/features/system-status";
 import {
   Component,
   useEffect,
@@ -26,14 +27,16 @@ import { api, result } from "@/api/client";
 import { AuthBoundary, useSession } from "@/auth";
 import { DraftProvider, useDraftGuard } from "@/drafts";
 import { Link, NavigationContext, useNavigate } from "@/navigation";
-import { OfficialUpdateNotice, OfficialUpdateProvider } from "@/updates";
+import { OfficialUpdateDialog, OfficialUpdateProvider, useOfficialUpdateAvailable } from "@/updates";
 import { deferOnboarding, deferredInstance } from "@/lib/onboarding";
 import { AppSidebar } from "@/components/app-sidebar";
 import { isGlobalNavigationPage, navigationSection, type NavigationSection } from "@/lib/navigation-selection";
 import { SiteHeader } from "@/components/site-header";
 import { TestPaymentProvider } from "@/components/test-payment-provider";
-import TestPayment from "@/pages/TestPayment";
+import { LegacyOverlayRedirect, OverlayHost, OverlayProvider } from "@/components/overlay-host";
 import { ErrorNotice, Loading } from "@/components/request-state";
+import { RequestNoticeProvider } from "@/lib/request-notices";
+import { RequestNoticeBanner } from "@/components/request-notice-banner";
 import { Button, buttonVariants } from "@/components/ui/button";
 import { Toaster } from "@/components/ui/toast";
 import {
@@ -58,14 +61,21 @@ const globalPageTitles: Record<NavigationSection, string> = {
   reconciliation: "对账",
   ledger: "支付宝流水",
   system: "运行状态",
+  audit: "审计日志",
   sites: "业务网站",
 };
 
 function AppShell() {
+  const location = useLocation();
+  const { switching } = useWorkspaceNavigation();
+  const backgroundInactive = !switching && new URLSearchParams(location.search).has(OVERLAY_PARAMETER);
   return (
+    <RequestNoticeProvider>
     <Toaster timeout={4000}>
     <SidebarProvider
       data-admin-console
+      data-overlay-background={backgroundInactive ? "inactive" : undefined}
+      inert={backgroundInactive}
       style={
         {
           "--sidebar-width": "calc(var(--spacing) * 72)",
@@ -82,14 +92,17 @@ function AppShell() {
       </ContentWidthProvider>
     </SidebarProvider>
     </Toaster>
+    </RequestNoticeProvider>
   );
 }
 function Workspace() {
   const systemName = useSystemName();
+  const updateAvailable = useOfficialUpdateAvailable();
   const scope = useWorkspace();
   const { switching } = useWorkspaceNavigation();
   const { setOpenMobile, toggleSidebar } = useSidebar();
   const session = useSession();
+  const health = useSystemStatus();
   const location = useLocation();
   const localPath = scope.clientId
     ? location.pathname.slice(scope.base.length) || "/"
@@ -161,6 +174,7 @@ function Workspace() {
   ]);
   return (
     <NavigationContext value={toggleSidebar}>
+      <OfficialUpdateDialog />
       <a
         href="#main-content"
         className="sr-only focus:not-sr-only focus:absolute focus:p-4"
@@ -170,6 +184,7 @@ function Workspace() {
       <AppSidebar
         variant="inset"
         pathname={location.pathname}
+        updateAvailable={updateAvailable}
         username={session.username}
         logoutPending={logout.isPending}
         onLogout={() => requestDiscard(() => logout.mutate())}
@@ -179,14 +194,12 @@ function Workspace() {
         <PageHeadingProvider routeKey={location.pathname}>
         <AdminContent busy={switching} layout={isReadableDetailPage(location.pathname) ? "detail" : "default"}>
           <PageHeadingSlot title={title} />
-          {(logout.error || session.error) && (
-            <div className="flex flex-col gap-4">
-              <ErrorNotice error={logout.error} />
-              <ErrorNotice error={session.error} retry={session.retry} />
-            </div>
-          )}
-          <OfficialUpdateNotice hidden={location.pathname === "/system"} />
+          <RequestNoticeBanner />
+          <ErrorNotice error={logout.error} />
+          <ErrorNotice scope="page" error={session.error} retry={session.retry} />
+          <ErrorNotice scope="page" error={health.status.error} retry={() => { void health.status.refetch(); }} />
           <WorkspaceOutlet />
+          <OverlayHost />
         </AdminContent>
         </PageHeadingProvider>
       </SidebarInset>
@@ -196,13 +209,25 @@ function Workspace() {
 export const appRoutes = createRoutesFromElements(
   <Route
     errorElement={<AppFailure />}
-    loader={({ request }) => {
+    loader={async ({ request }) => {
       const pathname = adminRoutePathname(new URL(request.url).pathname);
       const scope = workspaceScope(pathname);
       const localPath = scope.clientId ? pathname.slice(scope.base.length) || "/" : pathname;
-      return prepareWorkspaceNavigation(request, scope.clientId, localPath);
+      const target = readOverlayTarget(new URL(request.url).search);
+      const reads = [prepareWorkspaceNavigation(request, scope.clientId, localPath)];
+      if (target) {
+        const resource = workspaceScope(target.pathname);
+        if (resource.clientId && resource.clientId !== scope.clientId) {
+          const url = new URL(request.url);
+          url.pathname = target.pathname; url.search = target.search; url.hash = target.hash;
+          reads.push(prepareWorkspaceNavigation(new Request(url, { signal: request.signal }), resource.clientId, target.pathname.slice(resource.base.length) || "/"));
+        }
+      }
+      await Promise.all(reads);
+      return null;
     }}
-    shouldRevalidate={({ currentParams, nextParams }) => currentParams.clientId !== nextParams.clientId}
+    shouldRevalidate={({ currentParams, nextParams, currentUrl, nextUrl }) => currentParams.clientId !== nextParams.clientId ||
+      workspaceScope(readOverlayTarget(currentUrl.search)?.pathname ?? "/").clientId !== workspaceScope(readOverlayTarget(nextUrl.search)?.pathname ?? "/").clientId}
     hydrateFallbackElement={<main className="mx-auto flex min-h-svh max-w-md flex-col justify-center gap-6 p-6"><PageHeading title="正在打开页面" /><Loading label="正在打开页面…" /></main>}
     element={
       <AuthBoundary>
@@ -210,11 +235,13 @@ export const appRoutes = createRoutesFromElements(
         <DraftProvider>
           <WorkspaceProvider>
             <WorkspaceNavigationProvider>
+            <OverlayProvider>
             <TestPaymentProvider>
               <SystemStatusBoundary>
                 <AppShell />
               </SystemStatusBoundary>
             </TestPaymentProvider>
+            </OverlayProvider>
             </WorkspaceNavigationProvider>
           </WorkspaceProvider>
         </DraftProvider>
@@ -236,9 +263,7 @@ export const appRoutes = createRoutesFromElements(
     />
     <Route
       path="orders/:orderId"
-      lazy={async () => ({
-        Component: (await import("./pages/Orders")).OrderDetail,
-      })}
+      element={<LegacyOverlayRedirect />}
     />
     <Route
       path="work-items"
@@ -254,15 +279,11 @@ export const appRoutes = createRoutesFromElements(
     />
     <Route
       path="reconciliation/transactions/:ledgerEntryId"
-      lazy={async () => ({
-        Component: (await import("./pages/LedgerDetail")).default,
-      })}
+      element={<LegacyOverlayRedirect />}
     />
     <Route
       path="reconciliation/:kind/:resourceId"
-      lazy={async () => ({
-        Component: (await import("./pages/ReconciliationDetail")).default,
-      })}
+      element={<LegacyOverlayRedirect />}
     />
     <Route
       path="notifications"
@@ -278,15 +299,11 @@ export const appRoutes = createRoutesFromElements(
     />
     <Route
       path="ledger/:ledgerEntryId"
-      lazy={async () => ({
-        Component: (await import("./pages/ReconciliationRedirect")).LedgerDetailRedirect,
-      })}
+      element={<LegacyOverlayRedirect />}
     />
     <Route
       path="notifications/:deliveryId"
-      lazy={async () => ({
-        Component: (await import("./pages/Notifications")).NotificationDetail,
-      })}
+      element={<LegacyOverlayRedirect />}
     />
     <Route
       path="sites"
@@ -296,15 +313,11 @@ export const appRoutes = createRoutesFromElements(
     />
     <Route
       path="sites/new"
-      lazy={async () => ({
-        Component: (await import("./pages/Sites")).SiteEditorPage,
-      })}
+      element={<LegacyOverlayRedirect />}
     />
     <Route
       path="sites/defaults"
-      lazy={async () => ({
-        Component: (await import("./pages/Sites")).SiteDefaultsPage,
-      })}
+      element={<LegacyOverlayRedirect />}
     />
     <Route path="sites/:clientId">
       <Route
@@ -321,9 +334,7 @@ export const appRoutes = createRoutesFromElements(
       />
       <Route
         path="orders/:orderId"
-        lazy={async () => ({
-          Component: (await import("./pages/Orders")).OrderDetail,
-        })}
+        element={<LegacyOverlayRedirect />}
       />
       <Route
         path="notifications"
@@ -333,9 +344,7 @@ export const appRoutes = createRoutesFromElements(
       />
       <Route
         path="notifications/:deliveryId"
-        lazy={async () => ({
-          Component: (await import("./pages/Notifications")).NotificationDetail,
-        })}
+        element={<LegacyOverlayRedirect />}
       />
       <Route
         path="work-items"
@@ -345,20 +354,18 @@ export const appRoutes = createRoutesFromElements(
       />
       <Route
         path="reconciliation/:kind/:resourceId"
-        lazy={async () => ({
-          Component: (await import("./pages/ReconciliationDetail")).default,
-        })}
+        element={<LegacyOverlayRedirect />}
       />
       <Route
         path="settings/:section?"
-        lazy={async () => ({
-          Component: (await import("./pages/Sites")).SiteEditorPage,
-        })}
+        lazy={async () => ({ Component: (await import("./pages/Sites")).SiteSettingsPage })}
       />
+      <Route path="edit" element={<LegacyOverlayRedirect />} />
+      <Route path="summary" element={<LegacyOverlayRedirect />} />
     </Route>
     <Route
       path="settings/accounts/:accountId"
-      lazy={() => import("@/pages/AlipayAccounts").then(module => ({ Component: module.default }))}
+      element={<LegacyOverlayRedirect />}
     />
     <Route
       path="settings/onboarding/:step?"
@@ -372,13 +379,28 @@ export const appRoutes = createRoutesFromElements(
         Component: (await import("./pages/Settings")).default,
       })}
     />
+    <Route path="settings/:section/edit" element={<LegacyOverlayRedirect />} />
+    <Route path="settings/security/password" element={<LegacyOverlayRedirect />} />
+    <Route path="settings/security/access" element={<LegacyOverlayRedirect />} />
+    <Route path="settings/security/sessions/:sessionId" element={<LegacyOverlayRedirect />} />
+    <Route
+      path="audit"
+      lazy={async () => ({
+        Component: (await import("./pages/Audit")).default,
+      })}
+    />
+    <Route
+      path="audit/:source/:eventId"
+      element={<LegacyOverlayRedirect />}
+    />
+    <Route path="audit/status" element={<LegacyOverlayRedirect />} />
     <Route
       path="system"
       lazy={async () => ({
         Component: (await import("./pages/System")).default,
       })}
     />
-    <Route path="test-payment" element={<TestPayment />} />
+    <Route path="test-payment" element={<LegacyOverlayRedirect />} />
     <Route path="login" element={<Navigate to="/" replace />} />
     <Route path="setup" element={<Navigate to="/settings" replace />} />
     <Route

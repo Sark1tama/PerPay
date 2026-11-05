@@ -2,7 +2,8 @@ import { useWorkspace } from "@/workspace";
 import { Link } from "@/navigation";
 import { useWorkspaceApi } from "@/workspace";
 import { useRef, useState } from "react";
-import { refreshOperationalData, result, type PaymentMatchDetail } from "../../api/client";
+import { result, type PaymentMatchDetail } from "../../api/client";
+import { refreshFinancialRecords } from "@/lib/record-refresh";
 import { FinancialDialog } from "../../pages/FinancialDialog";
 import { ReasonDialog } from "../ReasonDialog";
 import { useSuccessToast } from "../Feedback";
@@ -63,12 +64,14 @@ export function ReverseMatchAction({
   match,
   embedded = false,
   inline = false,
+  technical = true,
   includeOrderIdentifiers = false,
   movesOnSuccess = false,
 }: {
   match: PaymentMatchDetail;
   embedded?: boolean;
   inline?: boolean;
+  technical?: boolean;
   includeOrderIdentifiers?: boolean;
   /** The surrounding list moves a reversed record into its history section. */
   movesOnSuccess?: boolean;
@@ -82,6 +85,7 @@ export function ReverseMatchAction({
     <>
       <RecordTools
         inline={inline}
+        technical={technical}
         label="收款关联记录操作"
         data={match}
         identifiers={[
@@ -138,7 +142,7 @@ export function ReverseMatchAction({
             setSnapshot(null);
             setSaved(true);
             setMessage("关联已撤销");
-            void refreshOperationalData();
+            void refreshFinancialRecords();
           }}
         >
           <DetailFields

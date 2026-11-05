@@ -1,5 +1,6 @@
 import { InlineEmpty } from "@/components/admin-empty";
 import { useId, useState } from "react";
+import { useInRouterContext, useLocation, useSearchParams } from "react-router";
 import { ChevronLeft, ChevronRight } from "lucide-react";
 import type { WebhookAttempt } from "@/api/client";
 import { useListSize } from "@/hooks/use-list-size";
@@ -24,20 +25,46 @@ import {
   TableRow,
 } from "@/components/ui/table";
 const PAGE_SIZE = 10;
-export function DeliveryAttempts({
-  attempts,
-  available,
-  readState,
-  density = "default",
-}: {
+type DeliveryAttemptsProps = {
   attempts: readonly WebhookAttempt[];
   available: boolean;
   readState?: "loading" | "failed";
   density?: "default" | "comfortable";
-}) {
+  pageKey?: string;
+  showHeading?: boolean;
+};
+
+export function DeliveryAttempts(props: DeliveryAttemptsProps) {
+  const routed = useInRouterContext();
+  return routed ? <RoutedDeliveryAttempts {...props} /> : <DeliveryAttemptsContent {...props} />;
+}
+
+function RoutedDeliveryAttempts({ pageKey = "attempts_page", ...props }: DeliveryAttemptsProps) {
+  const [search, setSearch] = useSearchParams();
+  const location = useLocation();
+  const value = Number(search.get(pageKey));
+  const page = Number.isSafeInteger(value) && value > 0 ? value : 1;
+  return <DeliveryAttemptsContent {...props} pagination={{ page, change(nextPage) {
+    const next = new URLSearchParams(search);
+    if (nextPage === 1) next.delete(pageKey);
+    else next.set(pageKey, String(nextPage));
+    setSearch(next, { replace: true, preventScrollReset: true, state: location.state });
+  } }} />;
+}
+
+function DeliveryAttemptsContent({
+  attempts,
+  available,
+  readState,
+  density = "default",
+  showHeading = true,
+  pagination,
+}: DeliveryAttemptsProps & { pagination?: { page: number; change: (page: number) => void } }) {
   const titleId = useId();
   const { ref, isSummary } = useListSize<HTMLElement>();
-  const [requestedPage, setPage] = useState(1);
+  const [localPage, setLocalPage] = useState(1);
+  const requestedPage = pagination?.page ?? localPage;
+  const setPage = pagination?.change ?? setLocalPage;
   const ordered = [...attempts].sort(
     (a, b) =>
       Date.parse(b.started_at) - Date.parse(a.started_at) ||
@@ -48,11 +75,11 @@ export function DeliveryAttempts({
   const page = Math.min(requestedPage, pages);
   const rows = ordered.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE);
   const comfortable = density === "comfortable";
+  const heading = <>投递尝试{available ? "（" + attempts.length + "）" : ""}</>;
   return (
     <section ref={ref} className={cn("flex min-w-0 flex-col", comfortable ? "gap-4" : "gap-3")} aria-labelledby={titleId} data-delivery-attempts data-density={comfortable ? "comfortable" : undefined}>
-      <h3 id={titleId} className="text-sm font-medium">
-        投递尝试{available ? "（" + attempts.length + "）" : ""}
-      </h3>
+      {showHeading ? <h3 id={titleId} className="text-sm font-medium">{heading}</h3>
+        : <span id={titleId} className="sr-only">{heading}</span>}
       {available ? (
         <>
           {isSummary && comfortable ? (

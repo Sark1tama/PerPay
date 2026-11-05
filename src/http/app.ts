@@ -2,7 +2,7 @@ import { assertSiteOrder, assertSiteResource, assertSiteLedger, SITE_ADMIN_ROUTE
 import { AlipayAccountError, alipayAccountIdSchema, createAlipayAccountInputSchema, updateAlipayAccountInputSchema, type AlipayAccountView } from "../alipay-accounts/model.ts";
 import type { AlipayAccountService } from "../alipay-accounts/service.ts";
 import { siteOverview } from "./site-overview.ts";
-import { collectionCodeInputSchema, providerApplicationInputSchema, instanceDisplayInputSchema } from "../settings/model.ts";
+import { collectionCodeInputSchema, providerApplicationInputSchema, instanceDisplayInputSchema, isProductionProvider } from "../settings/model.ts";
 import { SiteError, type SiteStore } from "../sites/store.ts";
 import { createSiteInputSchema, updateSiteInputSchema, updateSiteDefaultsInputSchema, siteClientIdSchema, type SiteSnapshot } from "../sites/model.ts";
 import { collectionPolicyInputSchema } from "../settings/collection-policy.ts";
@@ -64,7 +64,7 @@ import {
   type OrderProjection,
   type PublicCheckoutProjection,
 } from "../orders/model.ts";
-import { isCanonicalCheckoutToken } from "../orders/checkout-token.ts";
+import { digestCheckoutToken, isCanonicalCheckoutToken } from "../orders/checkout-token.ts";
 import { OrderError, type CreateOrderResult, type OrderErrorCode, type OrderService } from "../orders/service.ts";
 import {
   financialDecisionRequestSchema,
@@ -123,7 +123,7 @@ import {
 import { SettingsFieldError } from "../settings/validation.ts";
 import { collectionCodeError } from "../shared/collection-code.ts";
 import { APP_VERSION } from "../version.ts";
-import { OfficialUpdateChecker, UpdateCheckUnavailable } from "../update/checker.ts";
+import { OfficialUpdateChecker, UpdateCheckRateLimited, UpdateCheckUnavailable } from "../update/checker.ts";
 import { PublicCheckoutRateLimiter } from "./public-checkout-rate-limit.ts";
 import { parseStrictJson, StrictJsonError } from "./strict-json.ts";
 import {
@@ -138,6 +138,12 @@ import { type HttpErrorCode } from "./error-codes.ts";
 import { systemAnalytics } from "./system-analytics.ts";
 import { AdminOperationError } from "../database/admin-operation-store.ts";
 import { adminRefundMarks, adminRefundMarkHistory, refundMarkRequestSchema, setAdminRefundMark } from "../database/admin-refund-mark-store.ts";
+import type { ActivityRecorder } from "../audit/activity.ts";
+import { auditSiteContext, currentAuditContext } from "../audit/context.ts";
+import { appendAuditEvent } from "../database/identity-store.ts";
+import { auditExportSchema } from "../audit/query.ts";
+import { mountAuditRoutes } from "./audit-routes.ts";
+import { httpActivityMiddleware } from "./activity-middleware.ts";
 import {
   ADMIN_WORK_ITEM_TYPES,
   ADMIN_WORK_ITEM_VISIBILITIES,
@@ -234,6 +240,7 @@ const ledgerConflictResolutionSchema = z.object({
 }).strict();
 
 export interface AppDependencies {
+  readonly activity?: ActivityRecorder | undefined;
   readonly alipayAccounts?: AlipayAccountService | undefined;
   readonly accountHealth?: ((accountId: string) => { state: string; lastSuccessAt: number | null; lastErrorCode: string | null; collectionReady: boolean }) | undefined;
   readonly sites?: SiteStore | undefined;
@@ -248,7 +255,7 @@ export interface AppDependencies {
   readonly startedAt: Date;
   readonly clock?: (() => number) | undefined;
   readonly demoMode?: boolean;
-  readonly updateChecker?: Pick<OfficialUpdateChecker, "check"> | undefined;
+  readonly updateChecker?: (Pick<OfficialUpdateChecker, "check"> & Partial<Pick<OfficialUpdateChecker, "refreshAfterSeconds">>) | undefined;
   readonly backupHealth?: (() => BackupHealth | PromiseLike<BackupHealth>) | undefined;
   readonly ledger?: LedgerStore | undefined;
   readonly ledgerNextRunAt?: (() => number | null) | undefined;
@@ -377,6 +384,13 @@ export function createApp(dependencies: AppDependencies): Hono<AppEnvironment> {
     await next();
   });
 
+  app.use("*", httpActivityMiddleware<AppEnvironment>({
+    database: dependencies.database, recorder: dependencies.activity, clock: dependencies.clock,
+    requestId: context => context.get("requestId"), sourceAddress: context => remoteAddress(context, dependencies.config.trustedProxy),
+    isStaticAsset: path => path.startsWith("/admin/assets/") || path.startsWith("/assets/") ||
+      adminFrontend?.assets.has(path) === true || WEB_ASSET_PATHS.some(asset => asset === path),
+  }));
+
   app.use("*", async (context, next) => {
     const path = context.req.path;
     const isAdmin = path === "/admin" || path.startsWith("/admin/") ||
@@ -391,6 +405,8 @@ export function createApp(dependencies: AppDependencies): Hono<AppEnvironment> {
         if (path.startsWith("/api/")) {
           throw new HttpApiError(403, "admin_ip_not_allowed", "当前 IP 不允许访问管理员面板");
         }
+        const auditScope = currentAuditContext();
+        if (auditScope) auditScope.errorCode = "admin_ip_not_allowed";
         return context.text("403 — 当前 IP 不允许访问管理员面板。请联系管理员或使用服务器离线恢复命令。", 403);
       }
     }
@@ -493,10 +509,14 @@ export function createApp(dependencies: AppDependencies): Hono<AppEnvironment> {
     const sourceAddress = remoteAddress(context, dependencies.config.trustedProxy);
     if (!publicCheckoutBudget.take(sourceAddress)) {
       context.header("retry-after", "1");
+      const auditScope = currentAuditContext();
+      if (auditScope) auditScope.errorCode = "public_checkout_rate_limited";
       return context.html(renderCheckoutRejection(429, context.get("cspNonce")), 429);
     }
     const token = context.req.param("token");
     if (!isCanonicalCheckoutToken(token)) {
+      const auditScope = currentAuditContext();
+      if (auditScope) auditScope.errorCode = "checkout_not_found";
       return context.html(renderCheckoutRejection(404, context.get("cspNonce")), 404);
     }
 
@@ -505,6 +525,7 @@ export function createApp(dependencies: AppDependencies): Hono<AppEnvironment> {
     let status: 200 | 404 | 503 = 200;
     try {
       checkout = dependencies.orders.publicCheckout(token);
+      captureCheckoutAuditContext(dependencies, token);
       if (checkout.paymentInstructions !== null) requirePaymentEntryReady(dependencies, dependencies.orders.publicCheckoutOrderId(token));
     } catch (error) {
       if (error instanceof OrderError) {
@@ -539,6 +560,7 @@ export function createApp(dependencies: AppDependencies): Hono<AppEnvironment> {
         throw error;
       }
     }
+    if (initialError) { const auditScope = currentAuditContext(); if (auditScope) auditScope.errorCode = initialError.code; }
     return context.html(renderCheckoutPage({
         serverTime: dependencies.clock?.() ?? Date.now(),
         demoMode: dependencies.demoMode ?? false,
@@ -565,6 +587,7 @@ export function createApp(dependencies: AppDependencies): Hono<AppEnvironment> {
       );
     }
     const checkout = dependencies.orders.publicCheckout(context.req.param("token"));
+    captureCheckoutAuditContext(dependencies, context.req.param("token"));
     if (checkout.paymentInstructions === null) {
       throw new HttpApiError(404, "checkout_code_not_found", "收款码不可用");
     }
@@ -614,6 +637,8 @@ export function createApp(dependencies: AppDependencies): Hono<AppEnvironment> {
       identityContext(context, dependencies.config.trustedProxy),
       { remember: body.remember_me === true },
     );
+    const auditScope = currentAuditContext();
+    if (auditScope) { auditScope.actorType = "ADMIN"; auditScope.actorId = result.username; }
     setAuthenticationCookies(
       context,
       result.sessionToken,
@@ -632,6 +657,27 @@ export function createApp(dependencies: AppDependencies): Hono<AppEnvironment> {
   });
 
   const adminSession = requireAdminSession(dependencies.identity, dependencies.config.secureCookies);
+
+  mountAuditRoutes(app, {
+    database: dependencies.database, adminSession, clock: dependencies.clock,
+    captureState: () => dependencies.activity?.status(),
+    exportGuard: async (context, next) => {
+      requireJsonContentType(context);
+      requireSameOrigin(context, dependencies.config.publicOrigin);
+      requireCsrf(context, dependencies.identity, dependencies.config.secureCookies);
+      requireCurrentSession(context, dependencies.identity);
+      await next();
+    },
+    readExportBody: context => readJson(context, auditExportSchema, MAX_JSON_BODY_BYTES),
+    onExportGenerated: (context, summary) => {
+      const session = requireCurrentSession(context, dependencies.identity);
+      dependencies.database.write(connection => appendAuditEvent(connection, {
+        occurredAt: dependencies.clock?.() ?? Date.now(), actorType: "ADMIN", actorId: session.session.username,
+        action: "audit.export_generated", outcome: "SUCCESS", subjectType: "audit_export",
+        requestId: context.get("requestId"), details: { ...summary }, context: { siteId: null, siteName: null },
+      }));
+    },
+  });
 
   app.get("/api/admin/v1/session", adminSession, (context) => {
     const session = context.get("adminSession");
@@ -686,17 +732,23 @@ export function createApp(dependencies: AppDependencies): Hono<AppEnvironment> {
   app.get("/api/admin/v1/system/update", adminSession, async (context) => {
     const values = new URL(context.req.url).searchParams;
     const channels = values.getAll("channel");
+    const refreshes = values.getAll("refresh");
     const channel = channels[0] ?? "prerelease";
-    if ([...values.keys()].some(key => key !== "channel") || channels.length > 1 ||
-      (channel !== "stable" && channel !== "prerelease")) {
-      throw new HttpApiError(422, "validation_failed", "更新检查只接受单个有效的 channel 参数");
+    const refresh = refreshes[0] ?? "false";
+    if ([...values.keys()].some(key => key !== "channel" && key !== "refresh") || channels.length > 1 || refreshes.length > 1 ||
+      (channel !== "stable" && channel !== "prerelease") || (refresh !== "true" && refresh !== "false")) {
+      throw new HttpApiError(422, "validation_failed", "更新检查只接受单个有效的 channel 和 refresh 参数");
     }
     try {
-      return context.json({ data: await updateChecker.check(channel) });
+      const data = await updateChecker.check(channel, { refresh: refresh === "true" });
+      context.header("x-perpay-update-refresh-after", String(updateChecker.refreshAfterSeconds?.(channel) ?? 0));
+      return context.json({ data });
     } catch (error) {
+      if (error instanceof UpdateCheckRateLimited) {
+        throw new HttpApiError(429, "update_check_rate_limited", error.message, error.retryAfterSeconds);
+      }
       if (!(error instanceof UpdateCheckUnavailable)) throw error;
-      context.header("retry-after", String(error.retryAfterSeconds));
-      throw new HttpApiError(503, "update_check_unavailable", error.message);
+      throw new HttpApiError(503, "update_check_unavailable", error.message, error.retryAfterSeconds);
     }
   });
 
@@ -820,6 +872,12 @@ export function createApp(dependencies: AppDependencies): Hono<AppEnvironment> {
     const input = await readJson(context, orderExportSchema, MAX_JSON_BODY_BYTES);
     requireCurrentSession(context, dependencies.identity);
     const csv = exportOrders(dependencies.database, input, dependencies.clock?.() ?? Date.now());
+    dependencies.database.write(connection => appendAuditEvent(connection, {
+      occurredAt: dependencies.clock?.() ?? Date.now(), actorType: "ADMIN", actorId: context.get("adminSession").session.username,
+      action: "orders.export_generated", outcome: "SUCCESS", subjectType: "order_export", requestId: context.get("requestId"),
+      context: auditSiteContext(connection, context.get("adminSiteId") ?? input.api_client_id ?? null),
+      details: { created_from: input.created_from, created_to: input.created_to, output_bytes: Buffer.byteLength(csv, "utf8") },
+    }));
     return context.body(csv, 200, { "Content-Type": "text/csv; charset=utf-8", "Content-Disposition": 'attachment; filename="perpay-orders.csv"', "Cache-Control": "no-store" });
   });
 
@@ -1767,6 +1825,7 @@ export function createApp(dependencies: AppDependencies): Hono<AppEnvironment> {
     await readJson(context, emptyObjectSchema, 1024);
     const token = context.req.param("token");
     let checkout = dependencies.orders.publicCheckout(token);
+    captureCheckoutAuditContext(dependencies, token);
     const orderId = dependencies.orders.publicCheckoutOrderId(token);
     let verification = dependencies.checkoutVerification?.(orderId);
     if (checkout.checkout.status === "OPEN" && checkout.payment.status === "UNPAID") {
@@ -1792,6 +1851,7 @@ export function createApp(dependencies: AppDependencies): Hono<AppEnvironment> {
       );
     }
     const checkout = dependencies.orders.publicCheckout(context.req.param("token"));
+    captureCheckoutAuditContext(dependencies, context.req.param("token"));
     if (checkout.paymentInstructions !== null) requirePaymentEntryReady(dependencies, dependencies.orders.publicCheckoutOrderId(context.req.param("token")));
     const verification = dependencies.checkoutVerification?.(dependencies.orders.publicCheckoutOrderId(context.req.param("token")));
     return context.json({ data: { ...serializePublicCheckout(checkout), ...(verification ? {verification} : {}) } });
@@ -1827,6 +1887,11 @@ export function createApp(dependencies: AppDependencies): Hono<AppEnvironment> {
       if (values.has("api_client_id")) throw new HttpApiError(422, "validation_failed", "网站身份只能由路径指定");
       if (dependencies.demoMode && !["GET", "HEAD"].includes(context.req.method) && !context.req.path.endsWith("/orders/export")) throw new HttpApiError(403, "demo_read_only", "当前操作不可用。");
       context.set("adminSiteId", clientId);
+      const auditScope = currentAuditContext();
+      if (auditScope) {
+        const site = dependencies.sites!.get(clientId);
+        auditScope.siteId = clientId; auditScope.siteName = site?.configuration.name ?? null;
+      }
       dependencies.database.read(db => {
         for (const [param, kind] of [["orderId", "order"], ["deliveryId", "delivery"], ["paymentMatchId", "match"], ["candidateId", "candidate"], ["exceptionId", "exception"]] as const) {
           const id = context.req.param(param); if (id) assertSiteResource(db, clientId, kind, id);
@@ -1945,6 +2010,8 @@ function requireAdminSession(identity: IdentityService, secureCookies: boolean):
     const authenticated = token ? identity.authenticate(token) : undefined;
     if (!authenticated) throw new HttpApiError(401, "session_invalid", "会话不存在或已过期");
     context.set("adminSession", authenticated);
+    const auditScope = currentAuditContext();
+    if (auditScope) { auditScope.actorType = "ADMIN"; auditScope.actorId = authenticated.session.username; }
     await next();
   };
 }
@@ -2136,6 +2203,11 @@ function requireApiClient(
       throw new HttpApiError(409, "api_nonce_replayed", "请求 nonce 已被使用");
     }
     context.set("apiClientId", client.clientId);
+    const auditScope = currentAuditContext();
+    if (auditScope) {
+      auditScope.actorType = "API_CLIENT"; auditScope.actorId = client.clientId;
+      auditScope.siteId = client.clientId; auditScope.siteName = dependencies.sites?.get(client.clientId)?.configuration.name ?? null;
+    }
     await next();
   };
 }
@@ -2412,6 +2484,22 @@ function remoteAddress(
   );
 }
 
+function captureCheckoutAuditContext(dependencies: AppDependencies, token: string): void {
+  const scope = currentAuditContext();
+  if (!scope) return;
+  // Pure lookup: audit enrichment must not invoke a lazy expiry or verification path.
+  try {
+    const row = dependencies.database.read(db => db.prepare(`SELECT orders.order_id, orders.api_client_id,
+      json_extract(sites.configuration, '$.name') AS site_name FROM checkout_sessions checkout
+      JOIN payment_orders orders USING(order_id) LEFT JOIN sites ON sites.client_id = orders.api_client_id
+      WHERE checkout.token_digest = ?`).get(digestCheckoutToken(token)));
+    if (row) {
+      scope.siteId = String(row.api_client_id); scope.siteName = typeof row.site_name === "string" ? row.site_name : null;
+      scope.subjectType = "order"; scope.subjectId = String(row.order_id);
+    }
+  } catch { /* A failed metadata lookup does not change a checkout result. */ }
+}
+
 function currentLedgerHealth(
   dependencies: AppDependencies,
 ): RevisionedLedgerHealth {
@@ -2446,11 +2534,11 @@ function currentRuntimeStatus(dependencies: AppDependencies): PaymentRuntimeStat
   return {
     configured: snapshot !== undefined &&
       snapshot.collection !== null && collectionCodeError(snapshot.collection.codePayload) === null &&
-      snapshot.provider !== null &&
+      isProductionProvider(snapshot.provider) &&
       snapshot.activeProviderAccountKey !== null,
     transitioning: false,
     paymentRevision: snapshot?.paymentRevision ?? 0,
-    activeProviderAccountKey: snapshot?.activeProviderAccountKey ?? null,
+    activeProviderAccountKey: isProductionProvider(snapshot?.provider) ? snapshot.activeProviderAccountKey : null,
     scanIntervalMilliseconds: snapshot?.provider?.scanIntervalMilliseconds ?? null,
     maximumSuccessAgeMilliseconds:
       snapshot?.provider?.maximumSuccessAgeMilliseconds ?? null,
@@ -4234,6 +4322,8 @@ function errorResponse(
   message: string,
   fields?: Readonly<Record<string, string>>,
 ): Response {
+  const auditScope = currentAuditContext();
+  if (auditScope) auditScope.errorCode = code;
   return context.json(
     {
       error: {

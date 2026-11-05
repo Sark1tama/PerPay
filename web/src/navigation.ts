@@ -4,6 +4,8 @@ import { createContext, createElement, useCallback, useContext, useLayoutEffect,
 import { Link as RouterLink, NavLink as RouterNavLink, parsePath, useLocation, useNavigate as useRouterNavigate, type LinkProps, type NavLinkProps, type NavigateFunction, type NavigateOptions, type To } from "react-router";
 
 import { useReducedMotion } from "./lib/motion";
+import { useOptionalOverlayNavigation } from "./lib/overlay-context";
+import { parseOverlayTarget, withOverlayTarget } from "./lib/overlay-navigation";
 
 export const NavigationContext = createContext<(() => void) | null>(null);
 export const useNavigationMenu = () => useContext(NavigationContext);
@@ -42,7 +44,17 @@ function navigationFeedback(to: To) {
   return { "data-internal-link": internal ? "" : undefined };
 }
 
+function detailDestination(to: To, location: ReturnType<typeof useLocation>) {
+  const parts = typeof to === "string" ? parsePath(to) : to;
+  // Router-relative queries and anchors still belong to the foreground record.
+  // Resolve only pathless destinations here; other relative paths stay with RR.
+  return !parts.pathname && parseOverlayTarget(location)
+    ? parseOverlayTarget({ ...parts, pathname: location.pathname })
+    : parseOverlayTarget(to);
+}
+
 export function Link({ viewTransition = true, global = false, preserveSelectedSite = true, ...props }: LinkProps & NavigationOptions & { ref?: Ref<HTMLAnchorElement> }) {
+  const overlay = useOptionalOverlayNavigation();
   const enabled = useRouteMotion();
   const location = useLocation();
   const navigate = useRouterNavigate();
@@ -51,11 +63,20 @@ export function Link({ viewTransition = true, global = false, preserveSelectedSi
     location,
     preserveSelectedSite,
   );
+  const detailTarget = detailDestination(to, location);
+  const href = overlay && detailTarget ? withOverlayTarget(overlay.background, detailTarget) : to;
   const motion = viewTransition && enabled && destinationAllowsMotion(props.to) && !selectionOnlyNavigation(to, location);
-  return createElement(RouterLink, { ...props, ...navigationFeedback(to), to,
+  return createElement(RouterLink, { ...props, ...navigationFeedback(to), to: href,
     state: props.state !== undefined ? props.state : detailNavigationState(to, location), viewTransition: motion,
     onClick(event) {
       props.onClick?.(event);
+      if (overlay && detailTarget && !event.defaultPrevented && event.button === 0 && !event.metaKey && !event.altKey && !event.ctrlKey && !event.shiftKey &&
+        !props.reloadDocument && !props.download && (!props.target || props.target === "_self")) {
+        event.preventDefault();
+        overlay.open(detailTarget, { trigger: event.currentTarget, ...(props.replace !== undefined ? { replace: props.replace } : {}),
+          state: props.state !== undefined ? props.state : detailNavigationState(to, location, true) });
+        return;
+      }
       if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.altKey || event.ctrlKey || event.shiftKey ||
         props.reloadDocument || props.download || (props.target && props.target !== "_self") || props.state !== undefined || !isTransactionList(location.pathname, location.search)) return;
       const state = detailNavigationState(to, location, true);
@@ -80,6 +101,7 @@ type WorkspaceNavigateFunction = {
 };
 
 export function useNavigate(): WorkspaceNavigateFunction {
+  const overlay = useOptionalOverlayNavigation();
   const navigate = useRouterNavigate();
   const location = useLocation();
   const enabled = useRouteMotion();
@@ -91,19 +113,25 @@ export function useNavigate(): WorkspaceNavigateFunction {
       location,
       preserveSelectedSite,
     );
+    const detailTarget = detailDestination(to, location);
+    if (overlay && detailTarget) {
+      overlay.open(detailTarget, { ...(routerOptions.replace !== undefined ? { replace: routerOptions.replace } : {}),
+        state: routerOptions.state !== undefined ? routerOptions.state : detailNavigationState(to, location, true) });
+      return;
+    }
     return navigate(to, {
       ...routerOptions,
       state: routerOptions.state !== undefined ? routerOptions.state : detailNavigationState(to, location, true),
       viewTransition: routerOptions.viewTransition !== false && enabled && destinationAllowsMotion(destination) && !selectionOnlyNavigation(to, location),
     });
-  }) as WorkspaceNavigateFunction, [navigate, enabled, location]);
+  }) as WorkspaceNavigateFunction, [navigate, enabled, location, overlay]);
 }
 
 function localPath(path: string) { const scope = workspaceScope(path); return scope.clientId ? path.slice(scope.base.length) || "/" : path; }
 function isTransactionList(pathname: string, search: string) {
   return pathname === "/ledger" || (pathname === "/reconciliation" && !["conflicts", "exceptions"].includes(new URLSearchParams(search).get("tab") ?? ""));
 }
-const listLabels: Record<string, string> = { "/": "总览", "/orders": "订单列表", "/notifications": "通知", "/work-items": "待处理", "/reconciliation": "对账", "/ledger": "支付宝流水" };
+const listLabels: Record<string, string> = { "/": "总览", "/orders": "订单列表", "/notifications": "通知", "/work-items": "待处理", "/reconciliation": "对账", "/ledger": "支付宝流水", "/audit": "审计日志" };
 type ListReturn = { to: string; label: string; state?: unknown };
 function readListReturn(value: unknown): ListReturn | null {
   if (!value || typeof value !== "object") return null;
@@ -116,7 +144,7 @@ function detailNavigationState(destination: To, location: ReturnType<typeof useL
   const parts = typeof destination === "string" ? parsePath(destination) : destination;
   if (!parts.pathname && parts.hash) return location.state;
   const pathname = typeof destination === "string" ? destination.split(/[?#]/)[0]! : destination.pathname ?? "";
-  if (!["orders", "notifications", "reconciliation", "ledger"].includes(localPath(pathname).split("/")[1] ?? "") || !localPath(pathname).split("/")[2]) return undefined;
+  if (!["orders", "notifications", "reconciliation", "ledger", "audit"].includes(localPath(pathname).split("/")[1] ?? "") || !localPath(pathname).split("/")[2]) return undefined;
   if (workspaceScope(pathname).clientId !== workspaceScope(location.pathname).clientId) return undefined;
   const inherited = readListReturn(location.state?.listReturn);
   const label = listLabels[localPath(location.pathname)];
@@ -161,8 +189,8 @@ export function useDetailBack(to: string, label: string): ListReturn {
   const location = useLocation(), scope = workspaceScope(location.pathname);
   const saved = readListReturn(location.state?.listReturn);
   if (saved && workspaceScope(saved.to.split(/[?#]/)[0]!).clientId === scope.clientId) {
-    if (isTransactionList(saved.to.split(/[?#]/)[0]!, parsePath(saved.to).search ?? "") && isGlobalNavigationPage(location.pathname)) {
-      const target = parsePath(saved.to);
+    const target = parsePath(saved.to);
+    if ((target.pathname === "/audit" || isTransactionList(target.pathname!, target.search ?? "")) && isGlobalNavigationPage(location.pathname)) {
       return { ...saved, to: switchWorkspaceHref({ ...target, pathname: target.pathname! }, navigationSelection(location).clientId) ?? saved.to };
     }
     return saved;

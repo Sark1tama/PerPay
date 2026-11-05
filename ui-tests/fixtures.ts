@@ -63,7 +63,7 @@ export async function record(page: Page, info: TestInfo, extra = {}) {
     }).slice(0, 24).map(e => ({ tag: e.tagName, class: e.getAttribute("class"), text: e.textContent?.slice(0, 60), width: e.getBoundingClientRect().width, right: e.getBoundingClientRect().right })) }));
   const path = info.outputPath(`measurement-${sequence}.json`);
   writeFileSync(path, JSON.stringify({ ...extra, source: execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim(),
-    sourceDiff: createHash("sha256").update(execFileSync("git", ["-c", "core.safecrlf=false", "diff", "--binary", "HEAD", "--", "src", "web", "scripts"], { stdio: ["ignore", "pipe", "ignore"] })).digest("hex"),
+    sourceDiff: createHash("sha256").update(execFileSync("git", ["-c", "core.safecrlf=false", "diff", "--binary", "HEAD", "--", "src", "web", "scripts"], { stdio: ["ignore", "pipe", "ignore"], maxBuffer: 16 * 1024 * 1024 })).digest("hex"),
     adminBuild: createHash("sha256").update(readFileSync("web-dist/admin/index.html")).digest("hex"),
     checkoutBuild: createHash("sha256").update(readFileSync("web-dist/checkout/.vite/manifest.json")).digest("hex"),
     browser: page.context().browser()?.version(), requestedViewport: page.viewportSize(), url: page.url(), ...geometry }, null, 2));

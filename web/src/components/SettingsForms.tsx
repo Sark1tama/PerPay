@@ -4,35 +4,32 @@ import { setSystemName } from "@/branding";
 import {
   Fragment,
   useEffect,
+  useId,
   useRef,
   useState,
   type FormEvent,
   type ReactNode,
 } from "react";
 import { onlineManager, useMutation, useQueryClient } from "@tanstack/react-query";
-import {
-  ChartArea,
-  ChartColumn,
-  ChartLine,
-  ChevronDown,
-  Save,
-} from "lucide-react";
+import { ChevronDown, Save } from "lucide-react";
 import { collectionCodeError } from "../../../src/shared/collection-code";
 import { PROVIDER_TIMING_DEFAULTS } from "../../../src/shared/provider-defaults";
 import {
   ApiError,
   api,
   result,
-  type RuntimeSettings,
   type DashboardChartType,
+  type RuntimeSettings,
 } from "@/api/client";
 import { Link } from "@/navigation";
 import { cn } from "@/lib/utils";
 import { applicationKeyState } from "@/lib/application-key";
 import { useFormDraft } from "@/drafts";
+import { OverlayActions } from "@/components/overlay-actions";
+import { useOverlayCloseGuard, useOverlayContext } from "@/lib/overlay-context";
 import { useSuccessToast } from "@/components/Feedback";
 import { CollectionCodeField } from "@/components/CollectionCodeField";
-import { ApplicationKey } from "@/components/ApplicationKey";
+import { ApplicationKey, hasLegacyAlipayConfiguration, LegacyAlipayNotice } from "@/components/ApplicationKey";
 export { ApplicationKey } from "@/components/ApplicationKey";
 import { ErrorNotice } from "@/components/request-state";
 import { Button, buttonVariants } from "@/components/ui/button";
@@ -257,6 +254,10 @@ export function SettingsEditor({
   // Keep defaults stable for this mounted draft when a sibling form saves.
   // Explicit refreshes remount the editor; saves still use the latest revision.
   const [initialSettings] = useState(settings);
+  const overlay = useOverlayContext();
+  const formId = useId();
+  const legacyProvider = section === "provider" &&
+    (hasLegacyAlipayConfiguration(initialSettings) || hasLegacyAlipayConfiguration(settings));
   const [privateOpen, setPrivateOpen] = useState(false);
   function revealField(field: HTMLElement) {
     if (field.closest("[data-settings-private]")) setPrivateOpen(true);
@@ -266,13 +267,6 @@ export function SettingsEditor({
   }
   const draft = useFormDraft();
   const queryClient = useQueryClient();
-  const [environment, setEnvironment] = useState(
-    initialSettings.provider?.environment ?? "PRODUCTION",
-  );
-  useEffect(() => {
-    // Select updates its form input after committing the selected value.
-    if (section === "provider") draft.onChange();
-  }, [environment, section]);
   const [decoding, setDecoding] = useState(false);
   const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
   const [notificationEnabled, setNotificationEnabled] = useState(
@@ -282,8 +276,9 @@ export function SettingsEditor({
     settings.display?.checkout_show_product_name ?? true,
   );
   const [chartType, setChartType] = useState<DashboardChartType>(
-    settings.display?.dashboard_chart_type ?? "AREA",
+    initialSettings.display?.dashboard_chart_type ?? "AREA",
   );
+  const [savedChartType, setSavedChartType] = useState(chartType);
   useEffect(() => {
     if (section === "display") draft.onChange();
   }, [showProductName, chartType, section]);
@@ -296,11 +291,11 @@ export function SettingsEditor({
   // A parent that remounts this editor after saving keeps the same toast owner.
   const setSavedMessage = onFeedback ?? localFeedback;
   const submitting = useRef(false);
-  const canSave =
+  const canSave = !legacyProvider && (
     guided ||
     draft.dirty ||
     (section === "provider" && !settings.completion.provider) ||
-    (section === "collection" && !settings.completion.collection);
+    (section === "collection" && !settings.completion.collection));
   useEffect(() => {
     mounted.current = true;
     return () => {
@@ -311,9 +306,10 @@ export function SettingsEditor({
     networkMode: "always",
     retry: false,
     mutationFn: (form: FormData) => {
+      if (legacyProvider) throw new Error("旧沙箱接入已停用，请添加正式支付宝账号。");
       if (!onlineManager.isOnline() || !navigator.onLine)
         throw new Error("网络已断开，设置未提交。恢复连接后请重新提交。");
-      return saveSettings(section, form, settings);
+      return saveSettings(section, form, settings, savedChartType);
     },
     onSuccess: (data, form) => {
       if (!mounted.current) {
@@ -321,8 +317,13 @@ export function SettingsEditor({
         void queryClient.invalidateQueries({ queryKey: ["settings"], exact: true, refetchType: "none" });
         return;
       }
-      if (section === "display" && data.display?.system_name)
-        setSystemName(data.display.system_name);
+      if (section === "display") {
+        if (data.display?.system_name) setSystemName(data.display.system_name);
+        const savedType = data.display?.dashboard_chart_type ?? "AREA";
+        setChartType(savedType);
+        setSavedChartType(savedType);
+        form.set("dashboard_chart_type", savedType);
+      }
       draft.markSaved(form);
       const message = section === "backup" ? "备份策略已保存" : "已保存";
       setSavedMessage(message);
@@ -339,12 +340,15 @@ export function SettingsEditor({
       submitting.current = false;
     },
   });
+  // Submitted saves retain the existing draft-confirmation flow in DraftProvider.
+  useOverlayCloseGuard(() => decoding);
   useEffect(() => {
     // A mutation can publish field errors before its disabled fieldset is released.
     if (save.isPending) return;
-    const field = draft.form.current?.elements.namedItem(
-      Object.keys(fieldErrors)[0] ?? "",
-    );
+    const name = Object.keys(fieldErrors)[0] ?? "";
+    const field = name === "dashboard_chart_type"
+      ? draft.form.current?.querySelector<HTMLElement>('[data-settings-chart-default] [aria-pressed="true"]')
+      : draft.form.current?.elements.namedItem(name);
     if (!(field instanceof HTMLElement)) return;
     revealField(field);
     requestAnimationFrame(() => field.focus());
@@ -357,6 +361,8 @@ export function SettingsEditor({
     setSavedMessage("");
     save.mutate(new FormData(event.currentTarget));
   }
+
+  if (legacyProvider) return <LegacyAlipayNotice settings={hasLegacyAlipayConfiguration(settings) ? settings : initialSettings} />;
 
   const providerIdentity = (
     <FieldGroup>
@@ -372,9 +378,12 @@ export function SettingsEditor({
           autoComplete="off"
           aria-invalid={!!fieldErrors.app_id}
           aria-describedby={
-            fieldErrors.app_id ? "setting-app-id-error" : undefined
+            fieldErrors.app_id ? "setting-app-id-error setting-app-id-hint" : "setting-app-id-hint"
           }
         />
+        <FieldDescription id="setting-app-id-hint">
+          使用支付宝平台状态为“已上线”的应用；“开发中”应用不能查账。
+        </FieldDescription>
         {fieldErrors.app_id && (
           <FieldError id="setting-app-id-error">
             {fieldErrors.app_id}
@@ -476,53 +485,6 @@ export function SettingsEditor({
     setSavedMessage("");
     save.reset();
   }
-  const providerEnvironment = (
-      <Field data-invalid={!!fieldErrors.environment}>
-        <FieldLabel htmlFor="setting-environment">支付宝环境</FieldLabel>
-        <Select
-          name="environment"
-          value={environment}
-          disabled={save.isPending}
-          items={[
-            { value: "PRODUCTION", label: "生产环境" },
-            { value: "SANDBOX", label: "沙箱环境" },
-          ]}
-          onValueChange={(value) => {
-            if (value !== "PRODUCTION" && value !== "SANDBOX") return;
-            setEnvironment(value);
-            setSavedMessage("");
-            save.reset();
-            setFieldErrors((current) => {
-              const next = { ...current };
-              delete next.environment;
-              return next;
-            });
-          }}
-        >
-          <SelectTrigger
-            id="setting-environment"
-            className="w-full gap-1"
-            aria-invalid={!!fieldErrors.environment}
-            aria-describedby={
-              fieldErrors.environment ? "setting-environment-error" : undefined
-            }
-          >
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectGroup>
-              <SelectItem value="PRODUCTION">生产环境</SelectItem>
-              <SelectItem value="SANDBOX">沙箱环境</SelectItem>
-            </SelectGroup>
-          </SelectContent>
-        </Select>
-        {fieldErrors.environment && (
-          <FieldError id="setting-environment-error">
-            {fieldErrors.environment}
-          </FieldError>
-        )}
-      </Field>
-  );
   const providerCollection = (
     <FieldGroup className="settings-fields">
       <Button
@@ -747,7 +709,6 @@ export function SettingsEditor({
         <FieldLabel htmlFor="setting-system-name">支付系统名称</FieldLabel>
         <FieldContent className="min-w-0">
           <Input
-            className="max-w-md"
             id="setting-system-name"
             name="system_name"
             required
@@ -763,6 +724,37 @@ export function SettingsEditor({
               {fieldErrors.system_name}
             </FieldError>
           )}
+        </FieldContent>
+      </Field>
+      <Field orientation="vertical" className={displayRowClassName} data-invalid={!!fieldErrors.dashboard_chart_type}>
+        <FieldLabel id={formId + "-chart-label"}>收款趋势默认图形</FieldLabel>
+        <FieldContent className="min-w-0">
+          <input type="hidden" name="dashboard_chart_type" value={chartType} />
+          <ToggleGroup data-settings-chart-default variant="outline" value={[chartType]}
+            aria-labelledby={formId + "-chart-label"}
+            aria-describedby={formId + "-chart-hint" + (fieldErrors.dashboard_chart_type ? " " + formId + "-chart-error" : "")}
+            aria-invalid={!!fieldErrors.dashboard_chart_type}
+            className="w-full max-w-full flex-wrap items-stretch max-md:w-fit"
+            onValueChange={values => {
+              const value = values[0];
+              if (value !== "AREA" && value !== "BAR" && value !== "LINE") return;
+              setChartType(value);
+              setSavedMessage("");
+              save.reset();
+              setFieldErrors(current => {
+                if (!current.dashboard_chart_type) return current;
+                const next = { ...current };
+                delete next.dashboard_chart_type;
+                return next;
+              });
+            }}>
+            {([["AREA", "面积图"], ["BAR", "柱状图"], ["LINE", "折线图"]] as const).map(([value, label]) =>
+              <ToggleGroupItem key={value} value={value} type="button" disabled={save.isPending}
+                aria-invalid={!!fieldErrors.dashboard_chart_type}
+                className="h-auto min-h-8 min-w-0 flex-[1_1_6rem] whitespace-normal py-2 max-md:flex-[0_1_auto] max-md:py-1">{label}</ToggleGroupItem>)}
+          </ToggleGroup>
+          <FieldDescription id={formId + "-chart-hint"}>用于未设置个人图形偏好的浏览器。</FieldDescription>
+          {fieldErrors.dashboard_chart_type && <FieldError id={formId + "-chart-error"}>{fieldErrors.dashboard_chart_type}</FieldError>}
         </FieldContent>
       </Field>
       {!settings.site_mode && <>
@@ -794,37 +786,6 @@ export function SettingsEditor({
         </FieldContent>
       </Field>
       </>}
-      <Field orientation="vertical" className={displayRowClassName}>
-        <FieldLabel id="dashboard-chart-type-label">首页图表样式</FieldLabel>
-        <FieldContent className="min-w-0 items-start">
-          <input type="hidden" name="dashboard_chart_type" value={chartType} />
-          <ToggleGroup
-            spacing={0}
-            variant="outline"
-            className="min-w-0 max-w-full items-stretch"
-            value={[chartType]}
-            onValueChange={(values) => {
-              const value = values[0];
-              if (value === "AREA" || value === "BAR" || value === "LINE")
-                setChartType(value);
-            }}
-            aria-labelledby="dashboard-chart-type-label"
-          >
-            <ToggleGroupItem value="AREA" className="h-auto min-w-0 flex-1 shrink flex-wrap whitespace-normal">
-              <ChartArea />
-              面积图
-            </ToggleGroupItem>
-            <ToggleGroupItem value="BAR" className="h-auto min-w-0 flex-1 shrink flex-wrap whitespace-normal">
-              <ChartColumn />
-              柱状图
-            </ToggleGroupItem>
-            <ToggleGroupItem value="LINE" className="h-auto min-w-0 flex-1 shrink flex-wrap whitespace-normal">
-              <ChartLine />
-              折线图
-            </ToggleGroupItem>
-          </ToggleGroup>
-        </FieldContent>
-      </Field>
       {!settings.site_mode && <>
       <Field orientation="vertical" className={displayRowClassName}>
         <FieldLabel htmlFor="checkout-show-product-name">
@@ -868,7 +829,7 @@ export function SettingsEditor({
   );
 
   const panels: Array<{ title: string; description?: string; fields: ReactNode }> =
-    section === "provider" ? [{ title: "开放平台应用", fields: <FieldGroup>{providerIdentity}{providerEnvironment}</FieldGroup> }]
+    section === "provider" ? [{ title: "开放平台应用", fields: providerIdentity }]
     : section === "collection" ? [{ title: "收款码", fields: collectionIdentity }]
     : section === "collection-policy" ? [{ title: "PerPay 查账设置", fields: providerCollection }]
     : section === "display" ? [{ title: "界面显示", fields: displayFields }]
@@ -886,7 +847,8 @@ export function SettingsEditor({
         }
       />
       <Field orientation="horizontal" className="flex-wrap justify-end">
-        <Button type="submit" className="h-auto min-h-8 max-w-full whitespace-normal" disabled={decoding || !canSave || save.isPending} aria-busy={save.isPending}>
+        {overlay && !guided && <Button type="button" variant="outline" disabled={save.isPending || decoding} onClick={() => overlay.requestClose()}>关闭</Button>}
+        <Button form={formId} type="submit" className="h-auto min-h-8 max-w-full whitespace-normal" disabled={decoding || !canSave || save.isPending} aria-busy={save.isPending}>
           {save.isPending ? (
             <Spinner aria-hidden="true" data-icon="inline-start" />
           ) : (
@@ -906,6 +868,7 @@ export function SettingsEditor({
 
   const editor = (
     <form
+      id={formId}
       className={cn(
         "w-full min-w-0",
         guided && renderGuidedActions && "flex min-w-0 flex-col gap-5",
@@ -969,7 +932,8 @@ export function SettingsEditor({
                 <FieldGroup
                   className={cn(
                     "grid items-start gap-6",
-                    section === "display" && "w-full max-w-2xl",
+                    section === "display" && "w-full",
+                    section === "display" && !overlay && "max-w-2xl",
                     panels.length > 1 && "@3xl/settings:grid-cols-2",
                   )}
                 >
@@ -988,7 +952,7 @@ export function SettingsEditor({
                   ))}
                 </FieldGroup>
               </CardContent>
-              <CardFooter>{actions}</CardFooter>
+              {overlay ? <OverlayActions className="w-full">{actions}</OverlayActions> : <CardFooter>{actions}</CardFooter>}
             </Card>
           )}
           {guided && !renderGuidedActions && actions}
@@ -1033,6 +997,7 @@ async function saveSettings(
   section: ConfigurationSection,
   form: FormData,
   settings: RuntimeSettings,
+  savedChartType: DashboardChartType,
 ): Promise<RuntimeSettings> {
   const revision = settings.revision;
   const text = (key: string) => String(form.get(key) ?? "").trim();
@@ -1065,10 +1030,11 @@ async function saveSettings(
     ).data;
   }
   if (section === "provider") {
+    if (hasLegacyAlipayConfiguration(settings)) throw new Error("旧沙箱接入已停用，请添加正式支付宝账号。");
     const platformPublicKey = text("platform_public_key");
     if (!platformPublicKey) throw new SettingsInputError("platform_public_key", "请填写支付宝公钥。");
     return (await result(api.updateProviderSettings({ body: {
-      revision, environment: text("environment") === "SANDBOX" ? "SANDBOX" : "PRODUCTION",
+      revision, environment: "PRODUCTION",
       app_id: text("app_id"), platform_public_key: platformPublicKey,
       ...(text("private_key") ? { private_key: text("private_key") } : {}),
     } }))).data;
@@ -1112,12 +1078,9 @@ async function saveSettings(
     ).data;
   }
   if (section === "display") {
-    const chartType = text("dashboard_chart_type");
-    if (chartType !== "AREA" && chartType !== "BAR" && chartType !== "LINE")
-      throw new SettingsInputError(
-        "dashboard_chart_type",
-        "请选择有效的图表样式。",
-      );
+    const selectedType = text("dashboard_chart_type");
+    if (selectedType !== "AREA" && selectedType !== "BAR" && selectedType !== "LINE")
+      throw new SettingsInputError("dashboard_chart_type", "请选择有效的默认图形。");
     return (
       await result(
         api.updateDisplaySettings({
@@ -1125,7 +1088,9 @@ async function saveSettings(
             revision,
             system_name: text("system_name"),
             ...(settings.site_mode ? {} : { checkout_help_url: text("checkout_help_url") || null, checkout_show_product_name: form.has("checkout_show_product_name") }),
-            dashboard_chart_type: chartType,
+            dashboard_chart_type: selectedType === savedChartType
+              ? settings.display?.dashboard_chart_type ?? "AREA"
+              : selectedType,
           },
         }),
       )

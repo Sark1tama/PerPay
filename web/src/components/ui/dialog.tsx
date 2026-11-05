@@ -2,6 +2,7 @@ import * as React from "react"
 import { Dialog as DialogPrimitive } from "@base-ui/react/dialog"
 import { cn } from "cn"
 import { useOverlayViewport } from "@/hooks/use-overlay-viewport"
+import { useToastFooterRef } from "@/lib/toast-layout"
 
 import { Button } from "@/components/ui/button"
 import { XIcon } from "lucide-react"
@@ -43,25 +44,29 @@ function DialogContent({
   children,
   showCloseButton = true,
   portalProps,
+  backdropProps,
+  presentation = "dialog",
   style,
   ...props
 }: DialogPrimitive.Popup.Props & {
   showCloseButton?: boolean
-  portalProps?: Pick<DialogPrimitive.Portal.Props, "keepMounted" | "hidden" | "inert">
+  portalProps?: Pick<DialogPrimitive.Portal.Props, "keepMounted" | "hidden" | "inert" | "container">
+  backdropProps?: DialogPrimitive.Backdrop.Props
+  presentation?: "dialog" | "step"
 }) {
   const viewportStyle = useOverlayViewport()
   return (
     <DialogPortal {...portalProps}>
-      <DialogOverlay />
+      {presentation === "dialog" && <DialogOverlay {...backdropProps} />}
       <DialogPrimitive.Popup
         data-slot="dialog-content"
-        data-overlay-viewport="dialog"
+        data-overlay-viewport={presentation === "dialog" ? "dialog" : undefined}
         className={cn(
-          "fixed top-1/2 left-1/2 z-50 grid w-full max-w-[calc(100%-2rem)] -translate-x-1/2 -translate-y-1/2 gap-4 rounded-xl bg-popover p-4 text-sm text-popover-foreground ring-1 ring-foreground/10 duration-100 outline-none sm:max-w-sm data-open:animate-in data-open:fade-in-0 data-open:zoom-in-95 data-closed:animate-out data-closed:fade-out-0 data-closed:zoom-out-95",
+          presentation === "step" ? "relative flex min-h-0 w-full flex-1 flex-col gap-4 outline-none" : "fixed top-1/2 left-1/2 z-50 grid w-full max-w-[calc(100%-2rem)] -translate-x-1/2 -translate-y-1/2 gap-4 rounded-xl bg-popover p-4 text-sm text-popover-foreground ring-1 ring-foreground/10 duration-100 outline-none sm:max-w-sm data-open:animate-in data-open:fade-in-0 data-open:zoom-in-95 data-closed:animate-out data-closed:fade-out-0 data-closed:zoom-out-95",
           className
         )}
         {...props}
-        style={state => ({ ...viewportStyle, ...(typeof style === "function" ? style(state) : style) })}
+        style={state => ({ ...(presentation === "dialog" ? viewportStyle : {}), ...(typeof style === "function" ? style(state) : style) })}
       >
         {children}
         {showCloseButton && (
@@ -99,12 +104,15 @@ function DialogFooter({
   className,
   showCloseButton = false,
   children,
+  ref,
   ...props
 }: React.ComponentProps<"div"> & {
   showCloseButton?: boolean
 }) {
+  const footerRef = useToastFooterRef(ref)
   return (
     <div
+      ref={footerRef}
       data-slot="dialog-footer"
       className={cn(
         "-mx-4 -mb-4 flex flex-col-reverse gap-2 rounded-b-xl border-t bg-muted/50 p-4 sm:flex-row sm:justify-end",

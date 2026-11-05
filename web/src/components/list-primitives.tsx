@@ -1,10 +1,17 @@
-import { Children, useRef, useState, type ReactNode } from "react";
+import { Children, createContext, useContext, useRef, useState, type ReactNode } from "react";
 import { ChevronDown } from "lucide-react";
 import { cn } from "cn";
 import { dateTime, money } from "@/lib/format";
 import { ItemActions, ItemContent, ItemHeader, ItemTitle } from "@/components/ui/item";
 import { Button } from "@/components/ui/button";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+
+const CompactRowContext = createContext(false);
+/** Full details belong to the record surface; embedded summaries keep their own layout. */
+export function ListRowPresentation({ compact, children }: { compact: boolean; children: ReactNode }) {
+  return <CompactRowContext value={compact}>{children}</CompactRowContext>;
+}
 
 /** Shared typography for tables, overview rows and record summaries. */
 export function ListIdentity({
@@ -16,11 +23,12 @@ export function ListIdentity({
   meta?: ReactNode;
   description?: ReactNode;
 }) {
+  const compact = useContext(CompactRowContext);
   return (
     <div className="list-identity">
       <ItemTitle className="list-identity-title">{children}</ItemTitle>
-      {meta && <div className="list-identity-meta">{meta}</div>}
-      {description && <div className="list-identity-description">{description}</div>}
+      {!compact && meta && <div className="list-identity-meta">{meta}</div>}
+      {!compact && description && <div className="list-identity-description">{description}</div>}
     </div>
   );
 }
@@ -82,23 +90,29 @@ export function ListDateTime({
 export function ListSummary({
   identity,
   aside,
+  source,
   children,
   details,
 }: {
   identity: ReactNode;
   aside?: ReactNode;
+  /** Cross-site context stays visible without displacing the three key fields. */
+  source?: ReactNode;
   children?: ReactNode;
   /** Selected secondary fields; unmounted after this record finishes collapsing. */
   details?: ReactNode;
 }) {
-  const hasFields = Children.toArray(children).length > 0;
+  const compact = useContext(CompactRowContext);
+  const fields = Children.toArray(children);
+  const shown = compact ? fields.slice(0, 3) : fields;
   return (
     <ItemContent className="min-w-0 w-full">
       <ItemHeader className="list-summary-heading">
         <div className="list-summary-identity">{identity}</div>
         {aside && <ItemActions className="list-summary-aside">{aside}</ItemActions>}
       </ItemHeader>
-      {hasFields && <dl className="business-summary-fields">{children}</dl>}
+      {compact && source && <div className="list-summary-source flex min-w-0 items-baseline gap-1.5"><span className="shrink-0">网站</span>{source}</div>}
+      {shown.length > 0 && <dl className="business-summary-fields">{shown}</dl>}
       <ListSummaryDetails>{details}</ListSummaryDetails>
     </ItemContent>
   );
@@ -106,6 +120,7 @@ export function ListSummary({
 
 /** Also shared by overview records whose primary layout differs from ListSummary. */
 export function ListSummaryDetails({ children }: { children?: ReactNode }) {
+  const compact = useContext(CompactRowContext);
   const [expanded, setExpanded] = useState(false);
   const triggerRef = useRef<HTMLButtonElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
@@ -115,20 +130,24 @@ export function ListSummaryDetails({ children }: { children?: ReactNode }) {
     }
     setExpanded(open);
   }
-  if (Children.toArray(children).length === 0) return null;
+  if (compact || Children.toArray(children).length === 0) return null;
+  const label = expanded ? "收起信息" : "展开信息";
   return (
     <Collapsible open={expanded} onOpenChange={handleOpenChange} className="list-summary-details">
-      <CollapsibleTrigger
-        ref={triggerRef}
-        render={<Button type="button" variant="ghost" size="sm" className="list-summary-toggle" />}
-      >
-        {expanded ? "收起信息" : "展开信息"}
-        <ChevronDown
-          data-icon="inline-end"
-          aria-hidden="true"
-          className={cn("transition-transform duration-[var(--console-motion,200ms)] ease-[var(--console-ease,cubic-bezier(0.22,1,0.36,1))] motion-reduce:transition-none", expanded && "rotate-180")}
-        />
-      </CollapsibleTrigger>
+      <Tooltip>
+        <CollapsibleTrigger
+          ref={triggerRef}
+          aria-label={label}
+          render={<TooltipTrigger render={<Button type="button" variant="ghost" size="icon-sm" className="list-summary-toggle" />} />}
+        >
+          <ChevronDown
+            data-icon="inline-end"
+            aria-hidden="true"
+            className={cn("transition-transform duration-[var(--console-motion,200ms)] ease-[var(--console-ease,cubic-bezier(0.22,1,0.36,1))] motion-reduce:transition-none", expanded && "rotate-180")}
+          />
+        </CollapsibleTrigger>
+        <TooltipContent>{label}</TooltipContent>
+      </Tooltip>
       <CollapsibleContent
         ref={panelRef}
         className="-mx-1 h-[var(--collapsible-panel-height)] overflow-hidden transition-[height] duration-[var(--console-motion,200ms)] ease-[var(--console-ease,cubic-bezier(0.22,1,0.36,1))] data-starting-style:h-0 data-ending-style:h-0 motion-reduce:transition-none"
@@ -145,12 +164,14 @@ export function ListSummaryDetails({ children }: { children?: ReactNode }) {
 export function ListSummaryField({
   label,
   children,
+  visibleLabel = false,
 }: {
   label: string;
   children: ReactNode;
+  visibleLabel?: boolean;
 }) {
   return (
-    <div className="business-summary-field">
+    <div className="business-summary-field" data-visible-label={visibleLabel || undefined}>
       <dt>{label}</dt>
       <dd>{children}</dd>
     </div>

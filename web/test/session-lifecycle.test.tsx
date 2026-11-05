@@ -5,6 +5,7 @@ import {
   render,
   screen,
   waitFor,
+  within,
 } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { createMemoryRouter, RouterProvider } from "react-router";
@@ -13,6 +14,7 @@ import { describe, expect, it, vi } from "vitest";
 import { appRoutes } from "../src/App";
 import { queryClient, sessionKey } from "../src/api/client";
 import { apiError, json, settings } from "./fixtures";
+import { systemStatus } from "./onboarding-fixture";
 
 const session = {
   data: {
@@ -24,7 +26,11 @@ const session = {
 };
 
 function readResponse(request: Request) {
-  if (new URL(request.url).pathname === "/api/admin/v1/sites") {
+  const path = new URL(request.url).pathname;
+  if (path === "/api/admin/v1/system/status") {
+    return json({ data: systemStatus(settings) });
+  }
+  if (path === "/api/admin/v1/sites") {
     return json({ data: [], page: { next_cursor: null } });
   }
   return json({ data: settings });
@@ -48,13 +54,14 @@ function mount() {
   );
   queryClient.setQueryData(sessionKey, session);
   const router = createMemoryRouter(appRoutes, {
-    initialEntries: ["/settings/collection-policy"],
+    initialEntries: ["/settings/collection-policy/edit"],
   });
-  return render(
+  const view = render(
     <QueryClientProvider client={queryClient}>
       <RouterProvider router={router} />
     </QueryClientProvider>,
   );
+  return { ...view, router };
 }
 
 describe("administrator session lifecycle", () => {
@@ -62,42 +69,47 @@ describe("administrator session lifecycle", () => {
     "retains unsaved settings through a temporary %s session failure",
     async (failure) => {
       let unavailable = false;
-      vi.stubGlobal(
-        "fetch",
-        vi.fn(async (request: Request) => {
-          if (new URL(request.url).pathname.endsWith("/session")) {
-            if (unavailable && failure === "network")
-              throw new TypeError("temporary network outage");
-            return unavailable
-              ? apiError("temporary_unavailable", "temporary outage", 503)
-              : json(session);
-          }
-          return readResponse(request);
-        }),
-      );
-      mount();
+      const fetchMock = vi.fn(async (request: Request) => {
+        if (new URL(request.url).pathname.endsWith("/session")) {
+          if (unavailable && failure === "network")
+            throw new TypeError("temporary network outage");
+          return unavailable
+            ? apiError("temporary_unavailable", "temporary outage", 503)
+            : json(session);
+        }
+        return readResponse(request);
+      });
+      vi.stubGlobal("fetch", fetchMock);
+      const view = mount();
       const user = userEvent.setup();
       const ttl = await screen.findByLabelText("查账有效时限（秒）");
+      await waitFor(() => expect(queryClient.isFetching()).toBe(0));
+      expect(screen.queryByRole("alert")).not.toBeInTheDocument();
       await user.clear(ttl);
       await user.type(ttl, "450");
       unavailable = true;
       await act(async () => {
         await queryClient.refetchQueries({ queryKey: sessionKey, exact: true });
       });
-      await screen.findByRole("alert");
+      const failureNotice = await screen.findByRole("alert", { name: "服务连接提示" });
+      expect(screen.getAllByRole("alert")).toHaveLength(1);
       expect(screen.getByLabelText("查账有效时限（秒）")).toBe(ttl);
       expect(ttl).toHaveValue(450);
       expect(screen.getByText("未保存")).toBeVisible();
-      await user.click(screen.getByRole("tab", { name: "自动备份" }));
+      await act(async () => { await view.router.navigate("/settings/backup"); });
       expect(
         await screen.findByRole("alertdialog", { name: "放弃未保存的修改？" }),
       ).toBeVisible();
       await user.click(screen.getByRole("button", { name: "继续编辑" }));
       unavailable = false;
-      await user.click(screen.getByRole("button", { name: "重试" }));
+      await waitFor(() => expect(queryClient.isFetching()).toBe(0));
+      const beforeRetry = fetchMock.mock.calls.length;
+      await user.click(within(failureNotice).getByRole("button", { name: "重试" }));
       await waitFor(() =>
         expect(screen.queryByRole("alert")).not.toBeInTheDocument(),
       );
+      expect(fetchMock.mock.calls.slice(beforeRetry).map(([request]) => [request.method, new URL(request.url).pathname]))
+        .toEqual([["GET", "/api/admin/v1/session"]]);
       expect(screen.getByLabelText("查账有效时限（秒）")).toBe(ttl);
       expect(ttl).toHaveValue(450);
     },

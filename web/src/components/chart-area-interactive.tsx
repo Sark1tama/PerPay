@@ -1,8 +1,9 @@
 import { useId, useState } from "react";
 import { ChartArea, ChartColumn, ChartLine, Info } from "lucide-react";
 import type { DashboardChartType, SystemAnalytics } from "@/api/client";
+import { useChartType } from "@/hooks/use-chart-type";
 import { money, count } from "@/lib/format";
-import { buildTrendReport, type TrendMetric } from "@/lib/trend-analytics";
+import { buildTrendReport, type TrendView } from "@/lib/trend-analytics";
 import { dailyDateLabel } from "@/lib/daily-analytics";
 import { DailyAnalytics } from "@/components/daily-analytics";
 import { TrendPlot } from "@/components/trend-plot";
@@ -28,6 +29,7 @@ import {
 } from "@/components/ui/select";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { Button } from "@/components/ui/button";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import {
   Popover,
   PopoverContent,
@@ -41,10 +43,11 @@ const periods = [
   { value: "30", label: "近 30 天" },
   { value: "90", label: "近 90 天" },
 ];
-const metrics = [
+const individualMetrics = [
   { value: "amount", label: "确认金额" },
   { value: "orders", label: "新建订单" },
 ] as const;
+const metrics = [...individualMetrics, { value: "combined", label: "金额与订单" }] as const;
 const chartTypes = [
   { value: "AREA", label: "面积图", icon: ChartArea },
   { value: "BAR", label: "柱状图", icon: ChartColumn },
@@ -66,23 +69,20 @@ export function ChartAreaInteractive({
   pending: boolean;
   scopeKey?: string;
 }) {
-  const [metric, setMetric] = useState<TrendMetric>("amount");
+  const [metric, setMetric] = useState<TrendView>("amount");
   const [view, setView] = useState("chart");
   const [dailyVisited, setDailyVisited] = useState(false);
-  // The saved default can arrive asynchronously. A local choice lasts for this visit.
-  const [selectedType, setSelectedType] = useState<DashboardChartType | null>(
-    null,
-  );
-  const effectiveType = selectedType ?? chartType;
+  const [effectiveType, setSelectedType] = useChartType(chartType);
   const summaryId = useId();
   const report = analytics && !pending ? buildTrendReport(analytics) : null;
-  const summary = report?.[metric];
+  const singleMetric = metric === "combined" ? null : metric;
+  const summary = singleMetric ? report?.[singleMetric] : undefined;
   const data = report?.data ?? [];
   const hasDays = data.length > 0;
   const includeYear =
     data[0]?.date.slice(0, 4) !== data.at(-1)?.date.slice(0, 4);
   const singleActiveDay =
-    summary?.activeDays === 1 ? data.find((day) => day[metric] > 0) : null;
+    singleMetric && summary?.activeDays === 1 ? data.find((day) => day[singleMetric] > 0) : null;
   const format = (value: number | null | undefined) =>
     value == null
       ? "—"
@@ -103,131 +103,95 @@ export function ChartAreaInteractive({
         className="gap-4"
       >
         <CardHeader className="trend-header">
-          <div className="trend-title">
-            <CardTitle role="heading" aria-level={2}>
-              收款趋势
-            </CardTitle>
-            <Popover>
-              <PopoverTrigger
-                render={
-                  <Button
-                    variant="ghost"
-                    size="icon-sm"
+          <div className="trend-heading">
+            <div className="trend-identity">
+              <div className="trend-title">
+                <CardTitle role="heading" aria-level={2}>
+                  收款趋势
+                </CardTitle>
+                <Popover>
+                  <PopoverTrigger
+                    render={
+                      <Button
+                        variant="ghost"
+                        size="icon-sm"
+                        aria-label="统计口径"
+                      />
+                    }
+                  >
+                    <Info />
+                  </PopoverTrigger>
+                  <PopoverContent
+                    align="start"
                     aria-label="统计口径"
-                  />
-                }
-              >
-                <Info />
-              </PopoverTrigger>
-              <PopoverContent
-                align="start"
-                aria-label="统计口径"
-                className="flex flex-col gap-3"
-              >
-                <p className="text-sm">
-                  按北京时间统计：订单按创建时间，收款按 PerPay 确认时间。
-                </p>
-                <p className="text-sm">
-                  确认金额不是支付宝账单合计，未扣退款和费用，非净结算收入。确认笔数按确认次数计，不等于当前已确认订单数。
-                </p>
-                <p className="text-sm">
-                  待付款仅统计当前开放的待付款订单。日均与单日最高不含今天，包含零值日期；图表与每日横条按完整区间（含今天）展示。
-                </p>
-              </PopoverContent>
-            </Popover>
+                    className="flex flex-col gap-3"
+                  >
+                    <p className="text-sm">
+                      按北京时间统计：订单按创建时间，收款按 PerPay 确认时间。
+                    </p>
+                    <p className="text-sm">
+                      确认金额不是支付宝账单合计，未扣退款和费用，非净结算收入。确认笔数按确认次数计，不等于当前已确认订单数。
+                    </p>
+                    <p className="text-sm">
+                      待付款仅统计当前开放的待付款订单。日均与单日最高不含今天，包含零值日期；图表与每日横条按完整区间（含今天）展示。
+                    </p>
+                  </PopoverContent>
+                </Popover>
+              </div>
+              <CardDescription className="trend-dates" aria-live="polite">
+                {pending
+                  ? "正在读取近 " + range + " 天…"
+                  : hasDays
+                    ? <>
+                        <time dateTime={data[0]!.date}>{data[0]!.date}</time>
+                        {" — "}
+                        <time dateTime={data.at(-1)!.date}>{data.at(-1)!.date}</time>
+                      </>
+                    : "暂无数据"}
+              </CardDescription>
+            </div>
+            <div className="trend-controls">
+              <div className="trend-period">
+                <Select
+                  items={periods}
+                  value={String(range)}
+                  onValueChange={(value) => {
+                    if (value) onRangeChange(value);
+                  }}
+                >
+                  <SelectTrigger
+                    size="sm"
+                    aria-label="统计周期"
+                  >
+                    <SelectValue className="min-w-0" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectGroup>
+                      {periods.map((item) => (
+                        <SelectItem key={item.value} value={item.value}>
+                          {item.label}
+                        </SelectItem>
+                      ))}
+                    </SelectGroup>
+                  </SelectContent>
+                </Select>
+              </div>
+              <TabsList className="trend-tabs" aria-label="收款趋势视图">
+                <TabsTrigger value="chart">图表</TabsTrigger>
+                <TabsTrigger value="daily">每日数据</TabsTrigger>
+              </TabsList>
+            </div>
           </div>
-          <CardDescription className="trend-dates" aria-live="polite">
-            {pending
-              ? "正在读取近 " + range + " 天…"
-              : hasDays
-                ? data[0]!.date + " — " + data.at(-1)!.date
-                : "暂无数据"}
-          </CardDescription>
-          <SelectionMotionGroup>
-            <TabsList
-              className="trend-tabs"
-              variant="line"
-              aria-label="收款趋势视图"
-              data-selection-motion="underline"
-            >
-              <TabsTrigger value="chart">
-                <SelectionMotionIndicator
-                  active={view === "chart"}
-                  variant="underline"
-                />
-                图表
-              </TabsTrigger>
-              <TabsTrigger value="daily">
-                <SelectionMotionIndicator
-                  active={view === "daily"}
-                  variant="underline"
-                />
-                每日数据
-              </TabsTrigger>
-            </TabsList>
-          </SelectionMotionGroup>
-          <div className="trend-period">
-            <SelectionMotionGroup>
-              <ToggleGroup
-                value={[String(range)]}
-                onValueChange={(value) => {
-                  if (value[0]) onRangeChange(value[0]);
-                }}
-                variant="outline"
-                spacing={0}
-                size="sm"
-                className="hidden @[650px]/card:flex"
-                aria-label="统计周期"
-                data-selection-motion="fill"
-              >
-                {periods.map((item) => (
-                  <ToggleGroupItem key={item.value} value={item.value}>
-                    <SelectionMotionIndicator
-                      active={String(range) === item.value}
-                    />
-                    {item.label}
-                  </ToggleGroupItem>
-                ))}
-              </ToggleGroup>
-            </SelectionMotionGroup>
-            <Select
-              items={periods}
-              value={String(range)}
-              onValueChange={(value) => {
-                if (value) onRangeChange(value);
-              }}
-            >
-              <SelectTrigger
-                size="sm"
-                aria-label="统计周期"
-                className="@[650px]/card:hidden"
-              >
-                <SelectValue className="min-w-0" />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectGroup>
-                  {periods.map((item) => (
-                    <SelectItem key={item.value} value={item.value}>
-                      {item.label}
-                    </SelectItem>
-                  ))}
-                </SelectGroup>
-              </SelectContent>
-            </Select>
-          </div>
-        </CardHeader>
-        <TabsContent value="chart">
-          <CardContent className="trend-content">
+          {view === "chart" && (
             <div className="trend-toolbar">
               <SelectionMotionGroup>
                 <ToggleGroup
                   value={[metric]}
                   onValueChange={(value) => {
-                    if (value[0] === "amount" || value[0] === "orders")
+                    if (value[0] === "amount" || value[0] === "orders" || value[0] === "combined")
                       setMetric(value[0]);
                   }}
-                  variant="outline"
-                  spacing={0}
+                  spacing={1}
                   size="sm"
                   aria-label="趋势指标"
                   className="trend-metrics"
@@ -245,7 +209,7 @@ export function ChartAreaInteractive({
                   ))}
                 </ToggleGroup>
               </SelectionMotionGroup>
-              <SelectionMotionGroup>
+              {metric !== "combined" && <SelectionMotionGroup>
                 <ToggleGroup
                   value={[effectiveType]}
                   onValueChange={(value) => {
@@ -256,29 +220,47 @@ export function ChartAreaInteractive({
                     )
                       setSelectedType(value[0]);
                   }}
-                  variant="outline"
-                  spacing={0}
+                  spacing={1}
                   size="sm"
                   aria-label="图表类型"
                   className="trend-types"
                   data-selection-motion="fill"
                 >
                   {chartTypes.map(({ value, label, icon: Icon }) => (
-                    <ToggleGroupItem
-                      key={value}
-                      value={value}
-                      aria-label={label}
-                      title={label}
-                    >
-                      <SelectionMotionIndicator active={effectiveType === value} />
-                      <Icon data-icon="inline-start" />
-                      <span>{label}</span>
-                    </ToggleGroupItem>
+                    <Tooltip key={value}>
+                      <ToggleGroupItem
+                        value={value}
+                        aria-label={label}
+                        render={<TooltipTrigger />}
+                      >
+                        <SelectionMotionIndicator active={effectiveType === value} />
+                        <Icon aria-hidden="true" />
+                      </ToggleGroupItem>
+                      <TooltipContent role="tooltip" className="trend-type-tooltip">{label}</TooltipContent>
+                    </Tooltip>
                   ))}
                 </ToggleGroup>
-              </SelectionMotionGroup>
+              </SelectionMotionGroup>}
             </div>
-            <dl
+          )}
+        </CardHeader>
+        <TabsContent value="chart">
+          <CardContent className="trend-content">
+            {metric === "combined" ? (
+              <dl className="trend-summary trend-summary-combined" aria-label="金额与订单汇总">
+                {individualMetrics.map(({ value, label }) => (
+                  <div className="trend-total" key={value}>
+                    <dt>{label}</dt>
+                    <dd id={summaryId + value} data-metric-value data-trend-metric={value}
+                      className="whitespace-normal wrap-anywhere leading-tight">
+                      {pending ? <Skeleton className="h-9 w-32" /> : !report ? "—"
+                        : value === "amount" ? money(report.amount.total) : `${count(report.orders.total)} 笔`}
+                    </dd>
+                    <dd className="trend-summary-note">含今天 · {value === "amount" ? "按确认时间" : "按创建时间"}</dd>
+                  </div>
+                ))}
+              </dl>
+            ) : <dl
               className="trend-summary"
               aria-label={metric === "amount" ? "确认金额汇总" : "新建订单汇总"}
             >
@@ -329,9 +311,9 @@ export function ChartAreaInteractive({
                   )}
                 </dd>
               </div>
-            </dl>
-            {metrics
-              .filter((item) => item.value !== metric)
+            </dl>}
+            {individualMetrics
+              .filter((item) => metric !== "combined" && item.value !== metric)
               .map((item) => (
                 <span
                   key={item.value}
@@ -345,6 +327,9 @@ export function ChartAreaInteractive({
                       : count(report.orders.total)}
                 </span>
               ))}
+            <span id={summaryId + "combined"} className="sr-only">
+              {!report ? "—" : `确认金额 ${money(report.amount.total)}，新建订单 ${count(report.orders.total)} 笔`}
+            </span>
             {pending ? (
               <Skeleton
                 className="trend-plot w-full"
@@ -368,18 +353,18 @@ export function ChartAreaInteractive({
                 />
                 <div className="trend-caption">
                   <p>
-                    {summary?.activeDays
+                    {metric === "combined" ? `共 ${data.length} 天` : summary?.activeDays
                       ? `${metric === "amount" ? "有收款" : "有新订单"} ${summary.activeDays} 天 / 共 ${data.length} 天`
                       : metric === "amount"
                         ? "这段时间暂无确认收款"
                         : "这段时间暂无新建订单"}
                   </p>
-                  {singleActiveDay ? (
+                  {singleActiveDay && singleMetric ? (
                     <p data-trend-sparse>
                       <time dateTime={singleActiveDay.date}>
                         {singleActiveDay.date}
                       </time>
-                      <span>{format(singleActiveDay[metric])}</span>
+                      <span>{format(singleActiveDay[singleMetric])}</span>
                     </p>
                   ) : (
                     <p>按日展示 · 今天仍在累计</p>

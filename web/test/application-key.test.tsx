@@ -1,13 +1,17 @@
 import {
   act,
   fireEvent,
+  render,
   screen,
   waitFor,
   within,
 } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { QueryClientProvider } from "@tanstack/react-query";
+import { MemoryRouter } from "react-router";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { queryClient } from "../src/api/client";
+import { ApplicationKey, ApplicationKeyActivation } from "../src/components/ApplicationKey";
 import {
   applicationKeyState,
   canRegenerateApplicationKey,
@@ -17,10 +21,42 @@ import {
   onboardingPath,
 } from "../src/lib/onboarding";
 import { apiError, json } from "./fixtures";
-import { configuredThrough, mountOnboarding } from "./onboarding-fixture";
+import { configuredThrough, mountOnboarding, pendingApplicationKey } from "./onboarding-fixture";
 
 beforeEach(() => clearOnboardingDeferrals());
 const applicationPath = onboardingPath("application");
+
+describe("legacy sandbox application keys", () => {
+  it.each([
+    ["provider", "card"], ["provider", "activation"],
+    ["pending", "card"], ["pending", "activation"],
+  ] as const)("keeps the %s identity read-only through the standalone %s entry", (source, entry) => {
+    const settings = pendingApplicationKey();
+    if (source === "provider") settings.provider!.environment = "SANDBOX";
+    else settings.pending_application_key!.environment = "SANDBOX";
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const onSaved = vi.fn();
+    render(
+      <QueryClientProvider client={queryClient}>
+        <MemoryRouter>
+          {entry === "card" ? <ApplicationKey settings={settings} onSaved={onSaved} /> : (
+            <ApplicationKeyActivation settings={settings} onSaved={onSaved} renderActions={(actions) => actions}
+              onReload={vi.fn()} onLockChange={vi.fn()} onContinue={vi.fn()} />
+          )}
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    expect(screen.getByText("旧沙箱接入已停用")).toBeVisible();
+    expect(screen.getByText("原 App ID：test-app-id")).toBeVisible();
+    expect(screen.getByRole("link", { name: "添加正式支付宝账号" })).toHaveAttribute("href", "/settings/accounts/new");
+    expect(screen.queryByRole("button", { name: /生成|更换|启用/ })).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("支付宝公钥")).not.toBeInTheDocument();
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(onSaved).not.toHaveBeenCalled();
+  });
+});
+
 const body = async (view: ReturnType<typeof mountOnboarding>, index = 0) =>
   view.writes()[index]!.clone().json();
 
@@ -188,7 +224,7 @@ describe("application public key generation and replacement", () => {
   it("requires the newly retrieved Alipay public key without a redundant upload checkbox", async () => {
     const view = mountOnboarding({
       pendingKey: true,
-      path: "/settings/provider",
+      path: "/settings/provider/edit",
     });
     const user = userEvent.setup();
     await user.click(await screen.findByRole("button", { name: "验证并启用" }));
@@ -234,7 +270,7 @@ describe("application public key generation and replacement", () => {
     );
   });
 
-  it.each([onboardingPath("provider"), "/settings/provider"])(
+  it.each([onboardingPath("provider"), "/settings/provider/edit"])(
     "rejects empty and whitespace-only activation keys with an accessible inline error at %s",
     async (path) => {
       const view = mountOnboarding({ pendingKey: true, path });
@@ -288,7 +324,7 @@ describe("application public key generation and replacement", () => {
     let attempts = 0;
     const view = mountOnboarding({
       pendingKey: true,
-      path: "/settings/provider",
+      path: "/settings/provider/edit",
       handle: (request) =>
         request.url.endsWith("/actions/activate") && ++attempts === 1
           ? apiError(
@@ -300,7 +336,7 @@ describe("application public key generation and replacement", () => {
     });
     const user = userEvent.setup();
     await user.click(await screen.findByRole("button", { name: "验证并启用" }));
-    const dialog = await screen.findByRole("dialog");
+    const dialog = await screen.findByRole("dialog", { name: "验证并启用新应用公钥" });
     const input = within(dialog).getByLabelText("支付宝公钥");
     await user.type(input, "incorrect-platform-key");
     await user.click(
@@ -328,7 +364,7 @@ describe("application public key generation and replacement", () => {
   it("focuses invalid Alipay public-key input without locking corrections", async () => {
     const view = mountOnboarding({
       pendingKey: true,
-      path: "/settings/provider",
+      path: "/settings/provider/edit",
       handle: (request) =>
         request.url.endsWith("/actions/activate")
           ? json(
@@ -345,7 +381,7 @@ describe("application public key generation and replacement", () => {
     });
     const user = userEvent.setup();
     await user.click(await screen.findByRole("button", { name: "验证并启用" }));
-    const dialog = await screen.findByRole("dialog");
+    const dialog = await screen.findByRole("dialog", { name: "验证并启用新应用公钥" });
     const input = within(dialog).getByLabelText("支付宝公钥");
     await user.type(input, "synthetic-application-public-key");
     await user.click(
@@ -388,7 +424,7 @@ describe("application public key generation and replacement", () => {
     let attempts = 0;
     const view = mountOnboarding({
       pendingKey: true,
-      path: "/settings/provider",
+      path: "/settings/provider/edit",
       handle: (request) =>
         request.url.endsWith("/actions/activate") && ++attempts === 1
           ? Promise.reject(new Error("synthetic lost response"))
@@ -396,7 +432,7 @@ describe("application public key generation and replacement", () => {
     });
     const user = userEvent.setup();
     await user.click(await screen.findByRole("button", { name: "验证并启用" }));
-    const dialog = await screen.findByRole("dialog");
+    const dialog = await screen.findByRole("dialog", { name: "验证并启用新应用公钥" });
     const input = within(dialog).getByLabelText("支付宝公钥");
     await user.type(input, "fixed-platform-key");
     await user.click(
@@ -488,7 +524,7 @@ describe("application public key generation and replacement", () => {
   });
 
   it("keeps provider drafts when the discard prompt before regeneration is cancelled", async () => {
-    const view = mountOnboarding({ stage: 4, path: "/settings/provider" });
+    const view = mountOnboarding({ stage: 4, path: "/settings/provider/edit" });
     const input = await screen.findByLabelText("应用 ID（App ID）");
     fireEvent.change(input, { target: { value: "unsaved-provider" } });
     const user = userEvent.setup();

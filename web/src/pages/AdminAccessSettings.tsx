@@ -1,6 +1,10 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { onlineManager, useMutation, useQuery } from "@tanstack/react-query";
-import { api, result, ApiError, type RuntimeSettings } from "@/api/client";
+import { api, result, ApiError, queryClient, type RuntimeSettings } from "@/api/client";
+import { PageHeading } from "@/components/page-heading";
+import { useSuccessToast } from "@/components/Feedback";
+import { OverlayFormActions } from "@/components/overlay-actions";
+import { useOverlayCloseGuard, useOverlayContext } from "@/lib/overlay-context";
 import { useDirtyDraft } from "@/drafts";
 import {
   Card,
@@ -8,7 +12,6 @@ import {
   CardTitle,
   CardDescription,
   CardContent,
-  CardFooter,
 } from "@/components/ui/card";
 import {
   FieldGroup,
@@ -20,7 +23,7 @@ import {
 import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
 import { Button } from "@/components/ui/button";
-import { ErrorNotice } from "@/components/request-state";
+import { ErrorNotice, QueryView } from "@/components/request-state";
 import {
   Dialog,
   DialogContent,
@@ -31,6 +34,12 @@ import {
   DialogFooter,
 } from "@/components/admin-dialog";
 
+export function AdminAccessEditorPage() {
+  const success = useSuccessToast();
+  const settings = useQuery({ queryKey: ["settings"], queryFn: ({ signal }) => result(api.getRuntimeSettings({ signal })), staleTime: Infinity, refetchOnWindowFocus: false, refetchOnReconnect: false });
+  return <><PageHeading title="管理员 IP 白名单" /><QueryView query={settings}>{({ data }) => <AdminAccessSettings settings={data} onSaved={(next, message) => { queryClient.setQueryData(["settings"], { data: next }); if (message) success(message); }} />}</QueryView></>;
+}
+
 export function AdminAccessSettings({
   settings,
   onSaved,
@@ -38,6 +47,7 @@ export function AdminAccessSettings({
   settings: RuntimeSettings;
   onSaved: (settings: RuntimeSettings, message?: string) => void;
 }) {
+  const overlay = useOverlayContext();
   const initial = settings.admin_access;
   const [draft, setDraft] = useState<{
     enabled: boolean;
@@ -50,6 +60,7 @@ export function AdminAccessSettings({
     enabled !== initial.enabled || text !== initial.cidrs.join("\n");
   useDirtyDraft(dirty);
   const [confirm, setConfirm] = useState(false);
+  const confirmationBody = useRef<HTMLDivElement>(null);
   const source = useQuery({
     queryKey: ["admin-access-source"],
     queryFn: () => result(api.getAdminAccessSettings()),
@@ -83,10 +94,11 @@ export function AdminAccessSettings({
   });
   const fieldError =
     save.error instanceof ApiError ? save.error.fields.cidrs : undefined;
+  useOverlayCloseGuard(() => save.isPending);
   return (
     <Card>
       <CardHeader>
-        <CardTitle>管理员 IP 白名单</CardTitle>
+        {!overlay && <CardTitle>管理员 IP 白名单</CardTitle>}
         <CardDescription>
           仅限制管理员访问，仍需密码登录。
         </CardDescription>
@@ -169,31 +181,36 @@ export function AdminAccessSettings({
             </a>
           </FieldDescription>
           <ErrorNotice
+            scope="page"
             error={source.error}
             retry={() => void source.refetch()}
           />
           <ErrorNotice error={save.error} />
         </FieldGroup>
       </CardContent>
-      <CardFooter>
+      <OverlayFormActions>
+        {overlay && <Button type="button" variant="outline" disabled={save.isPending} onClick={() => overlay.requestClose()}>关闭</Button>}
         <Button
           disabled={!dirty || save.isPending}
           onClick={() => setConfirm(true)}
         >
           保存白名单
         </Button>
-      </CardFooter>
+      </OverlayFormActions>
       <Dialog
         open={confirm}
+        onOpenChangeComplete={(open) => {
+          if (open) confirmationBody.current?.focus({ preventScroll: true, focusVisible: true });
+        }}
         onOpenChange={(value) => {
           if (!save.isPending) setConfirm(value);
         }}
       >
-        <DialogContent>
+        <DialogContent initialFocus={false}>
           <DialogHeader>
             <DialogTitle>确认保存访问规则？</DialogTitle>
           </DialogHeader>
-          <DialogBody>
+          <DialogBody ref={confirmationBody} tabIndex={-1}>
             <DialogDescription>
               保存立即生效。启用时须允许当前
               IP；不匹配的来源即使已登录也会被拒绝。请确认有服务器离线恢复权限。

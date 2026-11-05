@@ -5,6 +5,7 @@ import { describe, it } from "node:test";
 
 import { createPreviewDemo, DEMO_QR_TEXT } from "../scripts/preview-demo.ts";
 import { renderCollectionCodeSvg } from "../src/http/web/collection-code.ts";
+import { PRODUCTION_PROVIDER_ENDPOINT } from "../src/settings/model.ts";
 
 const day = 86_400_000;
 const midnight = Math.floor((Date.now() + 8 * 3_600_000) / day) * day - 8 * 3_600_000;
@@ -33,6 +34,12 @@ describe("isolated documentation preview", () => {
       assert.equal(stats.daily.reduce((sum, row) => sum + row.confirmed_amount_cents, 0), stats.confirmations.amount_cents);
       assert.equal(stats.daily.reduce((sum, row) => sum + row.orders_created, 0), stats.orders.created);
       assert.equal(demo.database.integrityCheck().ok, true);
+      const accounts = demo.database.read(connection => connection.prepare("SELECT account_id, environment FROM alipay_accounts").all());
+      assert.ok(accounts.length > 0);
+      assert.ok(accounts.every(account => account.environment === "PRODUCTION"), "Preview accounts use the supported official environment");
+      const accountId = String(accounts[0]!.account_id);
+      const endpoints = demo.database.read(connection => connection.prepare("SELECT DISTINCT provider_endpoint FROM provider_account_bindings").all());
+      assert.deepEqual(endpoints.map(binding => binding.provider_endpoint), [PRODUCTION_PROVIDER_ENDPOINT], "Current and historical fixture sources use the official gateway");
       assert.ok(Number(demo.database.read(db => db.prepare("SELECT count(DISTINCT api_client_id) AS total FROM payment_orders").get()?.total)) >= 6);
       const scenarioOrderIds = new Set([
         ...Object.values(demo.scenarios.lifecycle),
@@ -56,6 +63,9 @@ describe("isolated documentation preview", () => {
         ["PUT", "/api/admin/v1/settings/provider"],
         ["POST", "/api/admin/v1/sites"],
         ["POST", "/api/admin/v1/settings/provider/verify"],
+        ["POST", "/api/admin/v1/alipay-accounts/" + accountId + "/check"],
+        ["POST", "/api/admin/v1/alipay-accounts/" + accountId + "/application-key/activate"],
+        ["POST", "/api/admin/v1/system/ledger/scan"],
         ["POST", "/api/admin/v1/sessions/00000000-0000-4000-8000-000000000001/revoke"],
         ["POST", "/api/admin/v1/sessions/revoke-others"],
         ["POST", "/api/admin/v1/sessions/revoke-all"],
@@ -124,6 +134,30 @@ describe("isolated documentation preview", () => {
       const csv = await app.request(base + "/orders/export", { method: "POST", headers, body: JSON.stringify({ created_from: date, created_to: date }) });
       assert.equal(csv.status, 200);
       assert.match(csv.headers.get("content-type")!, /text\/csv/);
+      const auditMeta = await app.request("/api/admin/v1/audit-events/meta", { headers });
+      assert.equal(auditMeta.status, 200);
+      const auditActions = (await auditMeta.json() as { data: { actions: { action: string }[] } }).data.actions.map(item => item.action);
+      for (const action of ["orders.created", "ledger.scan", "reconciliation.sweep", "webhook.delivery", "backup.cycle", "maintenance.publication_lock.clear", "system.started"]) {
+        assert.ok(auditActions.includes(action), `Preview must demonstrate ${action}`);
+      }
+      const summaries = await app.request("/api/admin/v1/audit-events?source=activity&action=http.request", { headers });
+      assert.equal(summaries.status, 200);
+      const summary = (await summaries.json() as { data: { event_count: number; first_occurred_at: string; last_occurred_at: string; source_address: string | null }[] }).data
+        .find(event => event.event_count === 18);
+      assert.ok(summary);
+      assert.equal(summary.source_address, "203.0.113.12");
+      assert.equal(Date.parse(summary.last_occurred_at) - Date.parse(summary.first_occurred_at), 25_000);
+      const auditExportPath = "/api/admin/v1/audit-events/export";
+      const exportBody = JSON.stringify({ created_from: date, created_to: date });
+      assert.equal((await app.request(auditExportPath, { method: "POST", headers: { cookie, Origin: demo.origin, "Content-Type": "application/json" }, body: exportBody })).status, 403);
+      const auditCsv = await app.request(auditExportPath, { method: "POST", headers, body: exportBody });
+      assert.equal(auditCsv.status, 200);
+      const auditBytes = Buffer.from(await auditCsv.arrayBuffer());
+      assert.deepEqual([...auditBytes.subarray(0, 3)], [0xef, 0xbb, 0xbf]);
+      assert.match(auditBytes.toString("utf8"), /http.request/);
+      assert.ok(demo.database.read(connection => connection.prepare("SELECT 1 FROM audit_events WHERE action = 'audit.export_generated'").get()));
+      assert.deepEqual(demo.database.read(connection => connection.prepare("SELECT * FROM payment_orders").all()), before,
+        "audit preview queries and exports must not mutate payment state");
       assert.equal((await app.request(base + "/test-payments", { method: "POST", headers, body: "{}" })).status, 403);
       assert.equal((await app.request("/admin/sites/" + clientId + "/orders", { headers })).status, 200);
       // An unavailable update is honest: no fabricated successful online version check.
@@ -170,6 +204,60 @@ describe("isolated documentation preview", () => {
       assert.deepEqual((await updated.json() as { data: unknown }).data, expected);
       assert.deepEqual(checks, ["stable"], "an explicitly supplied update checker serves the read-only metadata request");
     } finally { demo.dispose(); }
+  });
+
+  it("edits only disposable administrator data with real guards, audit and honest offline checks", async () => {
+    const originalFetch = globalThis.fetch;
+    let fetchAttempts = 0;
+    globalThis.fetch = async () => { fetchAttempts++; throw new Error("Interactive preview must stay offline"); };
+    let demo: Awaited<ReturnType<typeof createPreviewDemo>> | undefined;
+    try {
+      demo = await createPreviewDemo({ interactive: true });
+      const { app, origin } = demo;
+      const network = { incoming: { socket: { remoteAddress: "127.0.0.1", remotePort: 12345, remoteFamily: "IPv4" } } };
+      const loginStartedAt = Date.now();
+      const login = await app.request(origin + "/api/admin/v1/session/login", {
+        method: "POST", headers: { "Content-Type": "application/json", Origin: origin, "X-Forwarded-For": "203.0.113.77" }, body: JSON.stringify({ password: demo.password }),
+      }, network);
+      assert.equal(login.status, 200);
+      const loginContext = demo.database.read(connection => connection.prepare("SELECT context.source_address, event.occurred_at FROM audit_event_context context JOIN audit_events event USING(event_id) WHERE event.action = 'admin.login' ORDER BY event.sequence DESC LIMIT 1").get());
+      assert.equal(loginContext?.source_address, "127.0.0.1", "forward the real connection bindings while retaining the trusted proxy rules");
+      assert.ok(Number(loginContext?.occurred_at) >= loginStartedAt && Number(loginContext?.occurred_at) <= Date.now(),
+        "live administrator audit timestamps must not lag behind by the demo seeding duration");
+      const { data: session } = await login.json() as { data: { csrf_token: string } };
+      const cookie = login.headers.getSetCookie().map(value => value.split(";")[0]).join("; ");
+      const headers = { cookie, Origin: origin, "Content-Type": "application/json", "x-csrf-token": session.csrf_token };
+      const initial = await (await app.request("/api/admin/v1/settings", { headers })).json() as { data: { revision: number } };
+      const body = JSON.stringify({ revision: initial.data.revision, system_name: "预览编辑验收", dashboard_chart_type: "BAR" });
+      const save = (requestHeaders: Record<string, string>) => app.request(origin + "/api/admin/v1/settings/display", { method: "PUT", headers: requestHeaders, body });
+      assert.equal((await save({ "Content-Type": "application/json", Origin: origin })).status, 401);
+      assert.equal((await save({ cookie, "Content-Type": "application/json", Origin: origin })).status, 403);
+      assert.equal((await save({ ...headers, Origin: "https://other.example" })).status, 403);
+      const saved = await save(headers);
+      assert.equal(saved.status, 200);
+      assert.match(saved.headers.get("x-perpay-demo")!, /interactive; storage=temporary/);
+      assert.equal((await saved.json() as { data: { display: { system_name: string } } }).data.display.system_name, "预览编辑验收");
+      assert.equal((await save(headers)).status, 409, "the same old revision must still fail");
+      const audit = await (await app.request("/api/admin/v1/audit-events?source=core&action=settings.display_updated", { headers })).json() as { data: { action: string }[] };
+      assert.ok(audit.data.some(item => item.action === "settings.display_updated"));
+      const accounts = await (await app.request("/api/admin/v1/alipay-accounts", { headers })).json() as { data: { id: string }[] };
+      const check = await app.request("/api/admin/v1/alipay-accounts/" + accounts.data[0]!.id + "/check", { method: "POST", headers, body: "{}" });
+      assert.equal(check.status, 200);
+      const checked = await check.json() as { data: { ok: boolean; message: string } };
+      assert.equal(checked.data.ok, false);
+      assert.match(checked.data.message, /本地演示未连接支付宝/);
+      assert.equal((await app.request("/api/v1/orders", { method: "POST", headers, body: "{}" })).status, 403);
+      assert.equal((await app.request("/api/public/v1/checkouts/" + demo.checkout + "/check", { method: "POST", headers, body: "{}" })).status, 403);
+      assert.equal(await (await app.request("/api/public/v1/checkouts/" + demo.checkout + "/qr.svg")).text(), renderCollectionCodeSvg(DEMO_QR_TEXT));
+      assert.doesNotMatch(await (await app.request("/admin/")).text(), /data-perpay-demo="readonly"/);
+      assert.ok(demo.database.integrityCheck().ok);
+      assert.equal(fetchAttempts, 0);
+    } finally {
+      globalThis.fetch = originalFetch;
+      demo?.dispose();
+    }
+    assert.ok(demo);
+    assert.equal(existsSync(demo.directory), false);
   });
 
   it("rejects invalid ports and clocks before allocating a database", async () => {

@@ -1,5 +1,5 @@
 import { QueryClientProvider } from "@tanstack/react-query";
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import { ClipboardList, LayoutDashboard, Settings } from "lucide-react";
 import { MemoryRouter, Route, Routes } from "react-router";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -9,7 +9,7 @@ import { NavSecondary } from "../src/components/nav-secondary";
 import { SettingsEditor } from "../src/components/SettingsForms";
 import { SidebarProvider } from "../src/components/ui/sidebar";
 import { OrderDetail } from "../src/pages/OrderDetail";
-import { SecuritySettings } from "../src/pages/SecuritySettings";
+import { PasswordEditorPage, SecuritySettings } from "../src/pages/SecuritySettings";
 import { json, order, orderId, settings, withSessionList } from "./fixtures";
 
 describe("official block composition", () => {
@@ -79,8 +79,8 @@ describe("official block composition", () => {
   );
 
   it.each([
-    ["collection", "收款码", "收款码"],
-    ["display", "界面显示", "首页图表样式"],
+    ["collection", "收款码", "支付宝收款码内容"],
+    ["display", "界面显示", "支付系统名称"],
   ] as const)(
     "groups %s fields in one official card with fieldsets and a form-wide save footer",
     (section, first, second) => {
@@ -99,7 +99,7 @@ describe("official block composition", () => {
         .getByRole("group", { name: first })
         .closest("[data-slot=card]");
       const secondCard = screen
-        .getByRole("group", { name: second })
+        .getByRole("textbox", { name: second })
         .closest("[data-slot=card]");
       expect(firstCard).not.toBeNull();
       expect(secondCard).toBe(firstCard);
@@ -108,7 +108,8 @@ describe("official block composition", () => {
         const fields = screen.getByRole("group", { name: "界面显示" });
         expect(fields).toContainElement(screen.getByRole("textbox", { name: "支付系统名称" }));
         expect(fields).toContainElement(screen.getByRole("switch", { name: "收银台显示商品名称" }));
-        expect(fields).toContainElement(screen.getByRole("group", { name: "首页图表样式" }));
+        expect(fields).toContainElement(screen.getByRole("textbox", { name: "商家帮助链接" }));
+        expect(fields).toContainElement(screen.getByRole("group", { name: "收款趋势默认图形" }));
         expect(fields.querySelector("[data-slot=field-legend]")).toHaveClass("sr-only");
       }
       expect(container.querySelectorAll("[data-slot=card]")).toHaveLength(1);
@@ -121,62 +122,30 @@ describe("official block composition", () => {
     },
   );
 
-  it("keeps four security cards stable and password submission in the same form as its fields", () => {
+  it("keeps security summaries separate from the password form and preserves local input on rerender", () => {
     vi.stubGlobal("fetch", withSessionList(vi.fn(async () => json({ data: settings }))));
-    const { container, rerender } = render(
-      <QueryClientProvider client={queryClient}>
-        <MemoryRouter>
-          <SecuritySettings settings={settings} onSaved={vi.fn()} />
-        </MemoryRouter>
-      </QueryClientProvider>,
-    );
-    const card = screen
-      .getByRole("heading", { name: "修改密码" })
-      .closest("[data-slot=card]");
-    const submit = screen.getByRole("button", { name: "修改并重新登录" });
-    const grid = container.querySelector(".security-settings-card-grid")!;
-    const items = [...grid.children];
-    expect([...grid.children].map(item => item.querySelector("[data-slot=card-title]")?.textContent)).toEqual([
-      "管理员 IP 白名单", "密钥", "修改密码", "登录会话",
-    ]);
-    const sessions = screen.getByRole("heading", { name: "登录会话" }).closest("[data-slot=card]");
-    expect(items[3]).toContainElement(sessions as HTMLElement);
-    expect(submit.closest("[data-slot=card-footer]")).not.toBeNull();
-    expect(submit.closest("[data-slot=card]")).toBe(card);
-    expect(submit.closest("form")).toBe(
-      screen.getByLabelText("新密码").closest("form"),
-    );
-    expect(submit.closest("form")).toBe(
-      screen.getByLabelText("再次输入新密码").closest("form"),
-    );
-    expect(container.querySelectorAll("form")).toHaveLength(1);
-    expect(submit).toBeDisabled();
-    expect(screen.getAllByRole("button", { name: /^查看/ })).toHaveLength(4);
-    expect(screen.getByRole("button", { name: "生成 API 密钥" })).toBeEnabled();
-    const whitelist = screen.getByLabelText("允许的 IP / 网段");
+    const content = (revision: number) => <QueryClientProvider client={queryClient}><MemoryRouter>
+      <SecuritySettings settings={{ ...settings, revision }} onSaved={vi.fn()} />
+      <PasswordEditorPage />
+    </MemoryRouter></QueryClientProvider>;
+    const { container, rerender } = render(content(settings.revision));
+    const summary = container.querySelector<HTMLElement>("[data-security-summary]")!;
+    expect(summary.querySelector("form")).toBeNull();
+    expect(within(summary).getByRole("link", { name: "修改登录密码" })).toHaveAttribute("href", "/settings/security/password");
     const password = screen.getByLabelText("新密码");
-    fireEvent.change(whitelist, { target: { value: "192.0.2.0/24\n2001:db8::/32" } });
+    const confirmation = screen.getByLabelText("再次输入新密码");
+    const submit = screen.getByRole("button", { name: "修改并重新登录" });
+    expect(submit.closest("form")).toBe(password.closest("form"));
+    expect(confirmation.closest("form")).toBe(password.closest("form"));
+    expect(submit).toBeDisabled();
     fireEvent.change(password, { target: { value: "unsubmitted-password" } });
     password.focus();
-    rerender(
-      <QueryClientProvider client={queryClient}>
-        <MemoryRouter>
-          <SecuritySettings settings={{ ...settings, revision: settings.revision + 1 }} onSaved={vi.fn()} />
-        </MemoryRouter>
-      </QueryClientProvider>,
-    );
-    expect(container.querySelector(".security-settings-card-grid")).toBe(grid);
-    expect(grid.children).toHaveLength(items.length);
-    items.forEach((item, index) => expect(grid.children[index]).toBe(item));
-    expect(screen.getByRole("heading", { name: "登录会话" }).closest("[data-slot=card]")).toBe(sessions);
-    expect(screen.getByLabelText("允许的 IP / 网段")).toBe(whitelist);
-    expect(whitelist).toHaveValue("192.0.2.0/24\n2001:db8::/32");
+    rerender(content(settings.revision + 1));
     expect(screen.getByLabelText("新密码")).toBe(password);
     expect(password).toHaveValue("unsubmitted-password");
     expect(password).toHaveFocus();
   });
-
-  it("keeps amount and order cards independent in the original reading order", async () => {
+  it("keeps amount breakdown with the order facts before the related records", async () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(async (request: Request) => {
@@ -201,13 +170,14 @@ describe("official block composition", () => {
       </QueryClientProvider>,
     );
     await screen.findByRole("heading", { name: "订单信息" });
-    const amount = screen.getByRole("heading", { name: "金额" }).closest("[data-detail-grid-item]");
-    const information = screen.getByRole("heading", { name: "订单信息" }).closest("[data-detail-grid-item]");
-    expect(amount).not.toBeNull();
-    expect(information).not.toBeNull();
-    expect(amount).not.toBe(information);
-    expect(amount?.parentElement).toBe(information?.parentElement);
-    expect(amount!.compareDocumentPosition(information!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    const information = screen.getByRole("region", { name: "订单信息" });
+    for (const name of ["下单金额", "调整金额"]) {
+      expect(within(information).getByText(name, { selector: "dt" })).toBeVisible();
+    }
+    expect(screen.queryByRole("region", { name: "金额明细" })).not.toBeInTheDocument();
+    expect(information.closest("[data-detail-section]")).toHaveAttribute("data-detail-section", "overview");
+    expect(screen.queryByRole("tablist")).not.toBeInTheDocument();
+    expect(information.compareDocumentPosition(screen.getByRole("region", { name: "收款关联记录" })) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(
       screen.getByRole("heading", { name: order.product_name }),
     ).toBeVisible();

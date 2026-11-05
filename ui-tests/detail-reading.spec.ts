@@ -1,7 +1,9 @@
-import type { Page } from "@playwright/test";
+import type { Locator, Page } from "@playwright/test";
 import { test, expect, login, record, type Manifest } from "./fixtures";
 import { audit, screenshot } from "./audit";
-import { expectTouchTarget } from "./touch-targets";
+import { expectOverlayTarget, settleOverlay } from "./overlay-fixtures";
+import { expectTouchTarget, measureTouchTarget, waitForControlAnimations } from "./touch-targets";
+import { closeTechnicalDialog, detailSection, expectDetailFields, expectDetailRecordLayout, expectTechnicalDialogLayout, openTechnicalDialog } from "./detail-layout";
 import type { AdminLedgerDetail, AdminOrderDetail, PaymentMatchDetail, WebhookAttempt, WebhookDeliveryDetail } from "../web/src/api/generated/types.gen";
 
 const scenarios = [
@@ -13,7 +15,7 @@ const layoutScenarios = [
   ...scenarios,
   { ...scenarios[0], key: "notificationSite" },
   // The former global match detail now resolves to its unified transaction;
-  // the legitimate site detail above still exercises the standalone layout.
+  // the site detail above still exercises its scoped evidence sections.
   { ...scenarios[2], key: "matchInferred" },
 ] as const;
 
@@ -37,222 +39,257 @@ async function layout(page: Page, theme: "light" | "dark", mode: "compact" | "fu
     localStorage.setItem("perpay:content-width", mode);
   }, { theme, mode });
 }
+const foreground = (page: Page) => page.locator("[data-overlay-content]");
+const detailBody = (page: Page) => foreground(page).locator("[data-overlay-detail]");
+function targetUrl(page: Page, href = page.url()) {
+  const outer = new URL(href, page.url());
+  const target = outer.searchParams.get("overlay");
+  expect(target, "record links retain an explicit overlay resource").toBeTruthy();
+  return new URL(target!, outer.origin);
+}
+async function readDetailSection(page: Page, name: string | RegExp) {
+  const section = detailBody(page).getByRole("region", { name, exact: true }).and(detailBody(page).locator("[data-detail-section]"));
+  await expect(section).toBeVisible();
+  await section.evaluate(element => element.scrollIntoView({ block: "start", behavior: "instant" }));
+  await expect(section).toBeInViewport();
+  return section;
+}
 async function openDetail(page: Page, manifest: Manifest, key: string) {
   await page.goto(manifest.origin + "/admin" + detailPath(manifest, key));
-  await expect(page.locator("[data-detail-page]")).toBeVisible();
-  if (key.startsWith("notification") || key.startsWith("match")) await expect(page.locator("[data-detail-order-summary]")).toBeVisible();
-  else await expect(page.locator("[data-ledger-summary]")).toBeVisible();
-  await expect(page.locator('#main-content [data-slot="skeleton"]')).toHaveCount(0);
-  await expect(page.locator("#main-content [data-detail-identifier]")).toHaveCount(0);
+  await settleOverlay(page);
+  await expect(detailBody(page).locator("[data-detail-page]")).toBeVisible();
+  if (key.startsWith("notification")) await expect(detailSection(page, "overview").locator("[data-detail-order-summary]")).toBeVisible();
+  else if (key.startsWith("match")) {
+    const target = targetUrl(page);
+    const matchId = detailPath(manifest, key).split("/").at(-1)!;
+    const owner = target.pathname.startsWith("/sites/") ? detailBody(page).locator("[data-match-summary]") : detailBody(page).locator(`[data-ledger-match="${matchId}"]`);
+    await expect(owner.locator("[data-detail-order-summary]")).toBeVisible();
+  }
+  else await expect(detailBody(page).locator("[data-ledger-summary]")).toBeVisible();
+  await expect(detailBody(page).locator('[data-slot="skeleton"]')).toHaveCount(0);
+  await expect(detailBody(page).locator("[data-detail-identifier]")).toHaveCount(0);
   await page.evaluate(() => document.fonts.ready);
 }
-async function fields(page: Page, names: readonly string[]) {
-  const main = page.locator("#main-content");
-  for (const name of names) await expect(main.locator("dt").filter({ hasText: new RegExp("^" + name + "$") }).first()).toBeVisible();
+async function fields(owner: Locator, names: readonly string[]) {
+  for (const name of names) await expect(owner.locator("dt").filter({ hasText: new RegExp("^" + name + "$") })).toBeVisible();
+}
+
+async function expectAttemptHistory(owner: Locator, count: number) {
+  const name = `投递尝试（${count}）`;
+  const contents = owner.getByRole("table", { name, exact: true }).or(owner.getByRole("list", { name, exact: true }));
+  await expect(contents, "the visible history retains its accessible count without a repeated heading").toBeVisible();
+  await expect(owner.getByRole("heading", { name, exact: true })).toHaveCount(0);
+  return contents;
+}
+async function technicalSection(page: Page, label: string, sourceId?: string) {
+  if (label.includes("支付宝流水记录")) {
+    await readDetailSection(page, "交易");
+    return detailSection(page, "transaction").locator('[data-ledger-summary] [data-technical-information]');
+  }
+  if (label.includes("查账记录")) {
+    await readDetailSection(page, /^采集记录/);
+    expect(sourceId, "technical source tools retain the owning source identity").toBeTruthy();
+    return detailSection(page, "sources").locator(`[data-ledger-source="${sourceId}"]`)
+      .locator(':scope > [data-slot="item-content"] > [data-technical-information], :scope > [data-slot="card-content"] > [data-technical-information]');
+  }
+  if (label.includes("通知")) return detailSection(page, "overview").locator('[data-notification-information] [data-technical-information]');
+  const matchId = /^#match-(.+)$/.exec(targetUrl(page).hash)?.[1];
+  return matchId
+    ? detailSection(page, "payments").locator(`[data-ledger-match="${matchId}"] [data-match-summary] > [data-slot="card-content"] > [data-technical-information]`)
+    : detailBody(page).locator('[data-match-evidence] > [data-slot="card-content"] > [data-technical-information]');
 }
 async function keyboardTools(page: Page, label: string) {
-  const trigger = page.getByRole("button", { name: label, exact: true });
-  await trigger.focus();
-  await page.keyboard.press("Enter");
-  const menu = page.getByRole("menu");
-  await expect(menu).toBeVisible();
-  await menu.getByRole("menuitem", { name: "技术详情", exact: true }).focus();
-  await page.keyboard.press("Enter");
-  const dialog = page.getByRole("dialog", { name: "技术详情", exact: true });
-  await expect(dialog).toBeVisible();
-  await expect(dialog.getByRole("heading", { name: "技术详情", exact: true })).toBeFocused();
-  await page.keyboard.press("Escape");
-  await expect(dialog).toHaveCount(0);
-  await expect(menu).toHaveCount(0);
-  await expect(trigger).toBeFocused();
+  const technical = await technicalSection(page, label);
+  const session = await openTechnicalDialog(page, technical);
+  await page.keyboard.press("Tab");
+  await expect(session.close).toBeFocused();
+  await page.keyboard.press("Tab");
+  await expect(session.body.getByRole("button", { name: /^复制/ }).first()).toBeFocused();
+  const secondary = await expectTechnicalDialogLayout(session);
+  const restored = await closeTechnicalDialog(session);
+  return { secondary, parentOpened: session.opened, restored };
 }
-async function readingFlowGeometry(page: Page, longContent = false) {
-  const layouts = await page.locator('#main-content [data-detail-fields][data-density="comfortable"]').evaluateAll(containers => containers.map(container => ({ layout: container.getAttribute("data-layout"), credentials: !!container.closest("[data-detail-credentials]"), fields: container.querySelector("dl")?.textContent })));
-  for (const group of layouts) expect(group.layout === "flow" || (group.layout === "columns" && group.credentials), "comfortable facts must use flow or a credential section: " + group.fields).toBe(true);
-  await readingCredentialsGeometry(page);
-  const groups = await page.locator('#main-content [data-detail-fields][data-density="comfortable"][data-layout="flow"]').evaluateAll(containers => containers.map(container => {
-    const dl = container.querySelector("dl")!;
-    const bounds = container.getBoundingClientRect();
-    const style = getComputedStyle(dl);
-    const fields = Array.from(dl.children).map((field, index) => {
-      const term = field.querySelector("dt")!, definition = field.querySelector("dd")!;
-      const box = field.getBoundingClientRect(), label = term.getBoundingClientRect(), value = definition.getBoundingClientRect();
-      return { index, name: term.textContent, wide: field.getAttribute("data-field-wide") === "true", left: box.left, right: box.right, top: box.top, bottom: box.bottom, width: box.width,
-        labelTop: label.top, valueTop: value.top, actualGap: value.top - label.bottom,
-        gap: Number.parseFloat(getComputedStyle(field).rowGap), labelFont: Number.parseFloat(getComputedStyle(term).fontSize), valueFont: Number.parseFloat(getComputedStyle(definition).fontSize) };
-    });
-    const summary = container.closest("[data-detail-order-summary]");
-    const header = summary?.querySelector('[data-slot="item-header"]');
-    const title = header?.querySelector('[data-slot="item-title"]')?.getBoundingClientRect();
-    const badge = header?.querySelector('[data-slot="item-actions"] [data-slot="badge"]')?.getBoundingClientRect();
-    return { width: bounds.width, left: bounds.left, right: bounds.right, layout: container.getAttribute("data-layout"), display: style.display, wrap: style.flexWrap, direction: style.flexDirection,
-      rowGap: Number.parseFloat(style.rowGap), columnGap: Number.parseFloat(style.columnGap), fields,
-      orderSummary: !!summary, orderHeader: title && badge ? { titleTop: title.top, titleRight: title.right, badgeTop: badge.top, badgeLeft: badge.left } : null };
-  }));
-  expect(groups.length).toBeGreaterThan(0);
-  return groups.map(group => {
-    expect(group.layout, "flow facts: " + group.fields.map(field => field.name).join(" / ")).toBe("flow");
-    expect(group.display).toBe("flex");
-    expect(group.wrap).toBe("wrap");
-    expect(group.direction).toBe("row");
-    expect(group.rowGap).toBe(16);
-    expect(group.columnGap).toBe(24);
-    const rows: Array<typeof group.fields> = [];
-    for (const field of group.fields) {
-      expect(field.labelTop, field.name ?? "field").toBeLessThan(field.valueTop);
-      expect(field.gap, field.name ?? "field").toBe(8);
-      expect(Math.abs(field.actualGap - 8), field.name ?? "field").toBeLessThanOrEqual(0.5);
-      expect(field.labelFont, field.name ?? "field").toBeGreaterThanOrEqual(14);
-      expect(field.valueFont, field.name ?? "field").toBeGreaterThanOrEqual(14);
-      expect(field.left, field.name ?? "field").toBeGreaterThanOrEqual(group.left - 1);
-      expect(field.right, field.name ?? "field").toBeLessThanOrEqual(group.right + 1);
-      if (field.wide || group.width < 640) expect(Math.abs(field.width - group.width), field.name ?? "field").toBeLessThanOrEqual(1);
-      else {
-        expect(field.width, field.name ?? "field").toBeGreaterThanOrEqual(191);
-        expect(field.width, field.name ?? "field").toBeLessThanOrEqual(257);
-      }
-      const previous = group.fields[field.index - 1];
-      if (previous) {
-        expect(field.top, "DOM reading order: " + field.name).toBeGreaterThanOrEqual(previous.top - 1);
-        if (Math.abs(field.top - previous.top) <= 1) expect(field.left).toBeGreaterThan(previous.left);
-      }
-      const lastRow = rows.at(-1);
-      if (lastRow && Math.abs(lastRow[0]!.top - field.top) <= 1) lastRow.push(field);
-      else rows.push([field]);
-    }
-    for (const [index, row] of rows.entries()) {
-      expect(row.length).toBeLessThanOrEqual(4);
-      expect(Math.abs(row[0]!.left - group.left), "flow rows start at the left edge").toBeLessThanOrEqual(1);
-      if (group.width < 640 || row.some(field => field.wide)) expect(row).toHaveLength(1);
-      for (let item = 1; item < row.length; item++) expect(Math.abs(row[item]!.left - row[item - 1]!.right - 24)).toBeLessThanOrEqual(1);
-      const previous = rows[index - 1];
-      if (previous) expect(Math.abs(row[0]!.top - Math.max(...previous.map(field => field.bottom)) - 16), "flow row gap").toBeLessThanOrEqual(1);
-    }
-    if (group.orderSummary && !longContent) {
-      if (group.width >= 640) {
-        expect(group.orderHeader).not.toBeNull();
-        expect(Math.abs(group.orderHeader!.titleTop - group.orderHeader!.badgeTop)).toBeLessThanOrEqual(1);
-        expect(Math.abs(group.orderHeader!.badgeLeft - group.orderHeader!.titleRight - 12)).toBeLessThanOrEqual(1);
-      }
-      if (group.width >= 840) {
-        const facts = group.fields.filter(field => !field.wide);
-        expect(facts.map(field => field.name)).toEqual(["应付金额", "实收金额", "所属网站", "创建时间"]);
-        expect(facts.every(field => Math.abs(field.top - facts[0]!.top) <= 1)).toBe(true);
+// pre-wrap may hang line-ending spaces outside a line box. Check every
+// non-whitespace character with the same 1 px tolerance, and retain raw ranges
+// plus hanging whitespace as evidence instead of treating invisible advances as ink.
+function completeFieldGeometry(field: Element) {
+  const value = field.querySelector("dd")!, box = value.getBoundingClientRect();
+  const textElement = value.querySelector("span.break-all") ?? value;
+  const textBox = textElement.getBoundingClientRect();
+  const range = document.createRange(); range.selectNodeContents(textElement);
+  const raw = range.getBoundingClientRect();
+  const walker = document.createTreeWalker(textElement, NodeFilter.SHOW_TEXT);
+  const characters: Array<{ text: string; left: number; top: number; right: number; bottom: number }> = [];
+  const hangingWhitespace: Array<{ text: string; right: number; beyondRight: number }> = [];
+  while (walker.nextNode()) {
+    const node = walker.currentNode;
+    let offset = 0;
+    for (const text of node.textContent ?? "") {
+      const start = offset; offset += text.length;
+      range.setStart(node, start); range.setEnd(node, offset);
+      for (const rect of range.getClientRects()) {
+        if (!rect.width || !rect.height) continue;
+        if (text.trim()) characters.push({ text, left: rect.left, top: rect.top, right: rect.right, bottom: rect.bottom });
+        else if (rect.right > textBox.right + 1) hangingWhitespace.push({ text, right: rect.right, beyondRight: rect.right - textBox.right });
       }
     }
-    return { ...group, rows: rows.map(row => row.map(field => field.name)) };
-  });
+  }
+  const top = Math.min(...characters.map(character => character.top));
+  const bottom = Math.max(...characters.map(character => character.bottom));
+  return { name: field.querySelector("dt")!.textContent, fieldWidth: field.getBoundingClientRect().width,
+    containerWidth: field.parentElement!.parentElement!.getBoundingClientRect().width,
+    height: box.height, valueHeight: box.height, lineHeight: Number.parseFloat(getComputedStyle(value).lineHeight),
+    textHeight: bottom - top, boxHeight: textBox.height, textRight: Math.max(...characters.map(character => character.right)), boxRight: textBox.right,
+    textBottom: bottom, boxBottom: textBox.bottom, characterCount: characters.length, characterText: characters.map(character => character.text).join(""),
+    rawTextRight: raw.right, rawTextHeight: raw.height, hangingWhitespace };
 }
 
-async function readingCredentialsGeometry(page: Page) {
-  const sections = page.locator("#main-content [data-detail-credentials]");
-  for (const section of await sections.all()) {
-    await expect(section).toBeVisible();
-    await expect(section.getByRole("heading")).toBeVisible();
-    await expect(section.locator("button[aria-expanded]")).toHaveCount(0);
-  }
-  const groups = await sections.evaluateAll(sections => sections.map(section => {
-    const container = section.querySelector("[data-detail-fields]")!;
-    const dl = container.querySelector("dl")!, bounds = container.getBoundingClientRect(), style = getComputedStyle(dl);
-    return { width: bounds.width, left: bounds.left, right: bounds.right, layout: container.getAttribute("data-layout"), display: style.display,
-      columns: style.gridTemplateColumns.trim().split(/\s+/).length, columnGap: Number.parseFloat(style.columnGap), rowGap: Number.parseFloat(style.rowGap),
-      fields: Array.from(dl.children).map(field => {
-        const box = field.getBoundingClientRect(), term = field.querySelector("dt")!, value = field.querySelector("dd")!;
-        const labelBounds = term.getBoundingClientRect(), valueBounds = value.getBoundingClientRect();
-        const textElement = value.querySelector("span.break-all");
-        let textBounds = null;
-        if (textElement) {
-          const range = document.createRange(); range.selectNodeContents(textElement);
-          const text = range.getBoundingClientRect(), span = textElement.getBoundingClientRect();
-          textBounds = { textHeight: text.height, boxHeight: span.height, textRight: text.right, boxRight: span.right };
-        }
-        return { name: term.textContent, width: box.width, left: box.left, right: box.right, top: box.top, bottom: box.bottom,
-          actualGap: valueBounds.top - labelBounds.bottom, scrollWidth: value.scrollWidth, valueWidth: value.clientWidth, textBounds };
-      }),
-    };
-  }));
-  for (const group of groups) {
-    expect(group.layout).toBe("columns");
-    expect(group.display).toBe("grid");
-    expect(group.columns).toBe(group.width >= 640 ? 2 : 1);
-    expect(group.columnGap).toBe(16);
-    expect(group.rowGap).toBe(16);
-    const expectedWidth = (group.width - (group.columns - 1) * 16) / group.columns;
-    for (const [index, field] of group.fields.entries()) {
-      expect(Math.abs(field.width - expectedWidth), field.name ?? "credential").toBeLessThanOrEqual(1);
-      expect(Math.abs(field.left - group.left - (index % group.columns) * (expectedWidth + 16))).toBeLessThanOrEqual(1);
-      expect(field.right).toBeLessThanOrEqual(group.right + 1);
-      expect(Math.abs(field.actualGap - 8)).toBeLessThanOrEqual(0.5);
-      expect(field.scrollWidth, field.name ?? "credential").toBeLessThanOrEqual(field.valueWidth + 1);
-      if (field.textBounds) {
-        expect(field.textBounds.textHeight).toBeLessThanOrEqual(field.textBounds.boxHeight + 1);
-        expect(field.textBounds.textRight).toBeLessThanOrEqual(field.textBounds.boxRight + 1);
-      }
-      const previous = group.fields[index - 1];
-      if (previous) {
-        expect(field.top).toBeGreaterThanOrEqual(previous.top - 1);
-        if (index % group.columns !== 0) expect(Math.abs(field.top - previous.top)).toBeLessThanOrEqual(1);
-      }
-    }
-  }
+async function readingFlowGeometry(page: Page, _longContent = false) {
+  const groups = await expectDetailFields(detailBody(page).locator('[data-detail-fields][data-density="comfortable"][data-layout="flow"]:visible'));
+  expect(groups.length).toBeGreaterThan(0);
   return groups;
 }
-
-async function readingLayout(page: Page, mode: "compact" | "full") {
-  const geometry = await page.locator("#main-content").evaluate(main => {
-    const container = main.querySelector<HTMLElement>("[data-content-width]")!;
-    const detail = main.querySelector<HTMLElement>("[data-detail-page]")!;
-    const cards = Array.from(detail.querySelectorAll<HTMLElement>('[data-slot="card"]'));
-    return { width: container.getBoundingClientRect().width, maximum: Number.parseFloat(getComputedStyle(container).maxWidth),
-      layout: container.dataset.contentLayout, pageGap: Number.parseFloat(getComputedStyle(detail).rowGap),
-      cards: cards.map(card => ({ size: card.dataset.size, title: card.querySelector('[data-slot="card-title"]')?.textContent })),
-      timeFonts: Array.from(detail.querySelectorAll(".list-time")).map(time => ({ text: time.textContent, font: Number.parseFloat(getComputedStyle(time).fontSize) })),
-      overflowActions: cards.flatMap(card => {
-        const box = card.getBoundingClientRect();
-        return Array.from(card.querySelectorAll<HTMLElement>('[data-slot="card-action"] a, [data-slot="card-action"] button')).flatMap(action => {
-          const bounds = action.getBoundingClientRect();
-          return bounds.width && bounds.height && getComputedStyle(action).visibility !== "hidden" && (bounds.left < box.left - 1 || bounds.right > box.right + 1)
-            ? [{ label: action.getAttribute("aria-label") ?? action.textContent, left: bounds.left, right: bounds.right, cardLeft: box.left, cardRight: box.right }] : [];
-        });
-      }),
-    };
+async function readingCredentialsGeometry(page: Page) {
+  const sections = detailBody(page).locator("[data-detail-credentials]:visible");
+  for (const section of await sections.all()) {
+    await expect(section).toHaveAccessibleName(/.+/);
+    await expect(section.getByRole("heading")).toHaveCount(1);
+    await expect(section.locator("button[aria-expanded]")).toHaveCount(0);
+  }
+  return expectDetailFields(sections.locator("[data-detail-fields]"));
+}
+async function headerControlsGeometry(page: Page) {
+  const header = foreground(page).locator('[data-overlay-primary] > [data-slot="dialog-header"]');
+  const refresh = header.getByRole("button", { name: "刷新", exact: true });
+  const close = header.getByRole("button", { name: "关闭对话框", exact: true });
+  await expect(refresh).toBeVisible();
+  await expect(close).toBeVisible();
+  const measurements = await Promise.all([refresh, close].map(control => control.evaluate(element => {
+    const bounds = element.getBoundingClientRect(), header = element.closest('[data-slot="dialog-header"]')!.getBoundingClientRect();
+    const center = { x: bounds.left + bounds.width / 2, y: bounds.top + bounds.height / 2 };
+    const hit = document.elementFromPoint(center.x, center.y);
+    return { box: bounds.toJSON(), header: header.toJSON(), center, hit: hit === element || !!hit && element.contains(hit) };
+  })));
+  const [refreshGeometry, closeGeometry] = measurements;
+  expect(Math.abs(refreshGeometry!.center.y - closeGeometry!.center.y), "refresh and close share a visual center line").toBeLessThanOrEqual(1);
+  expect(Math.abs(refreshGeometry!.box.width - closeGeometry!.box.width), "header actions have equal widths").toBeLessThanOrEqual(1);
+  expect(Math.abs(refreshGeometry!.box.height - closeGeometry!.box.height), "header actions have equal heights").toBeLessThanOrEqual(1);
+  expect(Math.abs(closeGeometry!.box.right - closeGeometry!.header.right), "close occupies the trailing edge of the header").toBeLessThanOrEqual(1);
+  for (const control of measurements) {
+    expect(control.hit, "the center is an actionable part of its control").toBe(true);
+    expect(control.box.left).toBeGreaterThanOrEqual(control.header.left - 1);
+    expect(control.box.right).toBeLessThanOrEqual(control.header.right + 1);
+    expect(control.box.top).toBeGreaterThanOrEqual(control.header.top - 1);
+    expect(control.box.bottom).toBeLessThanOrEqual(control.header.bottom + 1);
+  }
+  return { refresh: refreshGeometry!, close: closeGeometry! };
+}
+async function notificationSectionAlignment(page: Page) {
+  const information = detailBody(page).locator('[data-notification-information]:visible');
+  if (!await information.count()) return null;
+  const summary = detailBody(page).locator('[data-detail-order-summary]');
+  await expect(summary).toBeVisible();
+  const boxes = await detailBody(page).evaluate(body => {
+    const summary = body.querySelector('[data-detail-order-summary]')!;
+    const notification = body.querySelector('[data-notification-information]')!;
+    return { summaryLeft: summary.getBoundingClientRect().left, summaryFieldsLeft: summary.querySelector('[data-detail-fields]')!.getBoundingClientRect().left,
+      notificationLeft: notification.getBoundingClientRect().left, notificationFieldsLeft: notification.querySelector('[data-detail-fields]')!.getBoundingClientRect().left };
   });
-  const maximum = mode === "compact" ? 1024 : 1280;
-  expect(geometry.layout).toBe("detail");
-  expect(geometry.maximum).toBe(maximum);
-  expect(geometry.width).toBeLessThanOrEqual(maximum);
-  if (page.viewportSize()?.width === 2190) expect(geometry.width).toBe(maximum);
-  expect(geometry.pageGap).toBe(24);
+  for (const left of [boxes.summaryLeft, boxes.summaryFieldsLeft, boxes.notificationFieldsLeft]) {
+    expect(Math.abs(left - boxes.notificationLeft), "related order and notification facts share the same left edge").toBeLessThanOrEqual(1);
+  }
+  return boxes;
+}
+async function readingLayout(page: Page, mode: "compact" | "full", alternativeTable?: string) {
+  await expect(page.locator("[data-content-width]")).toHaveAttribute("data-content-width", mode);
+  const geometry = await expectDetailRecordLayout(page, alternativeTable);
+  const header = await headerControlsGeometry(page);
+  const notificationAlignment = await notificationSectionAlignment(page);
   expect(geometry.cards.length).toBeGreaterThan(0);
-  expect(geometry.cards.filter(card => card.size !== "default")).toEqual([]);
-  expect(geometry.timeFonts.filter(time => time.font < 14)).toEqual([]);
-  expect(geometry.overflowActions).toEqual([]);
-  return geometry;
+  return { ...geometry, header, notificationAlignment };
 }
 
-test("detail pages separate standard cards into a readable business sequence", async ({ page, manifest }, info) => {
+test("headers without refresh keep close at the trailing edge and fully clickable", async ({ page, manifest }, info) => {
+  await login(page, manifest);
+  for (const width of [1440, 390]) {
+    await page.setViewportSize({ width, height: 900 });
+    await page.goto(manifest.origin + "/admin/settings/accounts/new");
+    const overlay = await settleOverlay(page);
+    await expectOverlayTarget(page, "/settings/accounts/new");
+    await expect(overlay.getByRole("textbox", { name: "账号名称", exact: true })).toBeVisible();
+    const header = overlay.locator('[data-overlay-primary] > [data-slot="dialog-header"]');
+    await expect(header.getByRole("button", { name: "刷新", exact: true })).toHaveCount(0);
+    const close = header.getByRole("button", { name: "关闭对话框", exact: true });
+    await waitForControlAnimations(close);
+    const edges = await close.evaluate(element => {
+      const bounds = element.getBoundingClientRect();
+      const centerHit = document.elementFromPoint(bounds.left + bounds.width / 2, bounds.top + bounds.height / 2);
+      return { close: bounds.toJSON(), header: element.closest('[data-slot="dialog-header"]')!.getBoundingClientRect().toJSON(),
+        borderRadius: getComputedStyle(element).borderRadius, centerHit: centerHit === element || !!centerHit && element.contains(centerHit) };
+    });
+    expect(Math.abs(edges.close.right - edges.header.right), "an empty action slot leaves no gap after close").toBeLessThanOrEqual(1);
+    const hitArea = width < 768 ? await expectTouchTarget(close) : await close.evaluate(measureTouchTarget);
+    expect(hitArea.fits, "the complete close target stays within the viewport").toBe(true);
+    expect(hitArea.points).toHaveLength(9);
+    if (width < 768) {
+      expect(hitArea.hits, "all nine mobile touch probes belong to close").toBe(true);
+      expect(hitArea.width).toBeGreaterThanOrEqual(44);
+      expect(hitArea.height).toBeGreaterThanOrEqual(44);
+    } else {
+      // Desktop icons may have rounded, non-painted bounding-box corners.
+      // Retain those raw probes, then verify the actual pointer and keyboard entry.
+      expect(edges.centerHit, "the desktop close center is actionable").toBe(true);
+      await close.focus();
+      await expect(close).toBeFocused();
+    }
+    await record(page, info, { feature: "overlay-empty-actions-header", width, edges, hitArea });
+    const capture = info.outputPath(`header-without-refresh-${width}.png`);
+    await page.screenshot({ path: capture, fullPage: false });
+    await info.attach(`header-without-refresh-${width}`, { path: capture, contentType: "image/png" });
+    if (width < 768) await close.click();
+    else await page.keyboard.press("Enter");
+    await page.clock.runFor(250);
+    await expect(overlay).toHaveCount(0);
+  }
+});
+
+test("detail overlays separate facts into readable business sections", async ({ page, manifest }, info) => {
   await page.setViewportSize({ width: 1440, height: 900 });
   await login(page, manifest);
   await layout(page, "dark", "compact");
+  let readingWidth: number | undefined;
   for (const scenario of [...scenarios, { ...scenarios[0], key: "notificationHttp" }]) {
     await openDetail(page, manifest, scenario.key);
-    const headings = page.locator("#main-content").getByRole("heading", { level: 2 });
+    const width = (await foreground(page).boundingBox())!.width;
+    readingWidth ??= width;
+    expect(width, "notifications, payment evidence and transaction details share the same reading width").toBe(readingWidth);
+    await expect(foreground(page).getByRole("tab")).toHaveCount(0);
     if (scenario.kind === "notification") {
-      await expect(headings).toHaveText(["关联订单", "通知信息", "投递历史"]);
-      await expect(page.getByRole("group", { name: "关联订单", exact: true }).locator("[data-detail-order-summary]")).toBeVisible();
-      await expect(page.getByRole("group", { name: "通知信息", exact: true }).getByRole("button", { name: "更多操作，通知记录操作", exact: true })).toBeVisible();
-      await expect(page.getByRole("group", { name: "投递历史", exact: true }).getByRole("heading", { name: "投递尝试（1）", exact: true })).toBeVisible();
+      await expect(detailSection(page, "overview").getByRole("heading", { level: 2 })).toHaveText(["通知信息", "关联订单"]);
+      await expect(detailBody(page).getByRole("group", { name: "关联订单", exact: true }).locator("[data-detail-order-summary]")).toBeVisible();
+      await expect(detailBody(page).getByRole("group", { name: "通知信息", exact: true }).getByRole("button", { name: "技术信息", exact: true })).toBeVisible();
+      await readDetailSection(page, "投递记录");
+      await expect(detailSection(page, "attempts").getByRole("heading", { level: 2 })).toHaveText(["投递历史"]);
+      await expectAttemptHistory(detailBody(page).getByRole("group", { name: "投递历史", exact: true }), 1);
+      await readDetailSection(page, "概况");
     } else if (scenario.kind === "match") {
-      await expect(headings).toHaveText(["关联摘要与订单", "支付宝交易", "匹配依据与处理记录"]);
-      await expect(page.getByRole("group", { name: "收款关联记录", exact: true }).locator("[data-detail-order-summary]")).toBeVisible();
-      await expect(page.getByRole("group", { name: "匹配依据与处理记录", exact: true }).getByRole("heading", { name: "匹配依据", exact: true })).toBeVisible();
+      await expect(detailBody(page).getByRole("heading", { level: 2 })).toHaveText(["关联摘要与订单", "支付宝交易", "匹配依据与处理记录"]);
+      await expect(detailBody(page).getByRole("group", { name: "收款关联记录", exact: true }).locator("[data-detail-order-summary]")).toBeVisible();
+      await expect(detailBody(page).getByRole("group", { name: "匹配依据与处理记录", exact: true }).getByRole("heading", { name: "匹配依据", exact: true })).toBeVisible();
     } else {
-      await expect(headings).toHaveText(["支付宝交易", "对应订单", /^查账记录（\d+）$/]);
-      await expect(page.locator('[data-detail-page] dt').filter({ hasText: /^支付宝 App ID$/ })).toHaveCount(0);
-      await expect(page.locator('[data-ledger-summary] [data-layout="flow"] dt')).toHaveText(["交易金额", "收款账号", "收支方向", "交易时间", "对方", "支付宝备注"]);
-      await expect(page.locator('[data-ledger-summary] [data-detail-credentials] dt')).toHaveText(["支付宝流水号", "支付宝订单号", "支付宝商户单号"]);
-      await expect(page.locator('[data-ledger-summary] dt').filter({ hasText: /业务网站|PerPay/ })).toHaveCount(0);
-      await expect(page.locator("#ledger-conflicts-heading")).toHaveCount(0);
+      await expect(detailSection(page, "transaction").getByRole("heading", { level: 2 })).toHaveText(["支付宝交易"]);
+      await expect(detailBody(page).locator('dt').filter({ hasText: /^支付宝 App ID$/ })).toHaveCount(0);
+      await expect(detailBody(page).locator('[data-ledger-summary] > [data-slot="card-content"] > [data-detail-fields] dt')).toHaveText(["交易金额", "收款账号", "收支方向", "交易时间", "对方", "支付宝备注"]);
+      await expect(detailBody(page).locator('[data-ledger-summary] [data-detail-credentials] dt')).toHaveText(["支付宝流水号", "支付宝订单号", "支付宝商户单号"]);
+      await expect(detailBody(page).locator('[data-ledger-summary] dt').filter({ hasText: /业务网站|PerPay/ })).toHaveCount(0);
+      await readDetailSection(page, "收款关联");
+      await expect(detailSection(page, "payments").getByRole("heading", { level: 2 })).toHaveText(["对应订单"]);
+      await expect(detailBody(page).locator("[data-ledger-match]").first()).toBeVisible();
+      await readDetailSection(page, /^采集记录/);
+      await expect(detailSection(page, "sources").getByRole("heading", { level: 2 })).toHaveText([/^查账记录（\d+）$/]);
+      await expect(detailBody(page).locator("[data-ledger-source]").first()).toBeVisible();
+      await expect(detailSection(page, "conflicts")).toHaveCount(0);
+      await readDetailSection(page, "交易");
     }
     const geometry = await readingLayout(page, "compact");
     const flows = await readingFlowGeometry(page);
@@ -261,114 +298,146 @@ test("detail pages separate standard cards into a readable business sequence", a
   }
 });
 
-test("flow summaries wrap at container boundaries without stretching two facts across a card", async ({ page, manifest }, info) => {
+test("summaries and credentials wrap at their content widths without stretching short facts", async ({ page, manifest }, info) => {
   await page.setViewportSize({ width: 2190, height: 900 });
   await login(page, manifest);
   await layout(page, "dark", "full");
-  await openDetail(page, manifest, "notificationDns");
-  const container = page.locator('[data-detail-order-summary] [data-detail-fields]');
-  const originalWidth = await container.evaluate(element => (element as HTMLElement).style.width);
-  const boundaries = [];
-  try {
-    for (const requestedWidth of [639, 640, 840, 1024, 1280]) {
-      await container.evaluate((element, width) => { (element as HTMLElement).style.width = width + "px"; }, requestedWidth);
-      const summary = (await readingFlowGeometry(page)).find(group => group.orderSummary)!;
-      expect(summary.width).toBe(requestedWidth);
-      if (requestedWidth < 640) expect(summary.rows.every(row => row.length === 1)).toBe(true);
-      else if (requestedWidth === 640) {
-        expect(summary.rows[0]!.length).toBeGreaterThan(1);
-        expect(summary.rows[0]!.length).toBeLessThan(4);
-        const short = summary.fields.filter(field => !field.wide);
-        expect(short.at(-1)!.top).toBeGreaterThan(short[0]!.top);
-      } else expect(summary.rows[0]).toEqual(["应付金额", "实收金额", "所属网站", "创建时间"]);
-      boundaries.push({ requestedWidth, actualWidth: summary.width, rows: summary.rows, fieldWidths: summary.fields.map(field => field.width) });
+  const checkWrapping = async (container: Locator) => {
+    const originalWidth = await container.evaluate(element => (element as HTMLElement).style.width);
+    const originalFont = await page.evaluate(() => document.documentElement.style.fontSize);
+    const names = await container.locator("dt").allTextContents();
+    const wrapping = [];
+    try {
+      for (const textPercent of [100, 200]) {
+        await page.evaluate(percent => document.documentElement.style.fontSize = percent + "%", textPercent);
+        const samples: Awaited<ReturnType<typeof expectDetailFields>> = [];
+        for (const requestedWidth of [320, 480, 720, 960]) {
+          await container.evaluate((element, width) => { (element as HTMLElement).style.width = width + "px"; }, requestedWidth);
+          const measured = (await expectDetailFields(container))[0]!;
+          expect(measured.width).toBe(requestedWidth);
+          expect(measured.fields.map(field => field.name)).toEqual(names);
+          expect(measured.rows.flat(), "responsive wrapping retains DOM reading order").toEqual(names);
+          samples.push(measured);
+          wrapping.push({ textPercent, requestedWidth, height: measured.height, rows: measured.rows,
+            fieldWidths: measured.fields.map(field => ({ name: field.name, wide: field.wide, width: field.width, inline: field.inline })) });
+        }
+        const narrow = samples[0]!, roomy = samples.at(-1)!;
+        expect(roomy.height, "additional width never adds vertical space to the same facts").toBeLessThanOrEqual(narrow.height + 1);
+        if (roomy.orderSummary) {
+          const shortFacts = ["应付金额", "实收金额", "所属网站"];
+          expect(roomy.rows.some(row => shortFacts.every(name => row.includes(name))), "at least three short facts fit together when their natural widths fit").toBe(true);
+          expect(roomy.rows.length, "narrow layouts wrap the same complete facts into more rows").toBeLessThan(narrow.rows.length);
+          expect(roomy.height, "content wrapping produces a shorter summary when space is available").toBeLessThan(narrow.height);
+          for (const name of shortFacts.slice(0, 2)) {
+            const first = narrow.fields.find(field => field.name === name)!, last = roomy.fields.find(field => field.name === name)!;
+            expect(first.inline, name + " remains beside its label even in the narrow sample").toBe(true);
+            expect(last.inline).toBe(true);
+            expect(Math.abs(first.width - last.width), name + " does not grow to fill a fraction of the wider container").toBeLessThanOrEqual(1);
+          }
+          expect(roomy.fields.find(field => field.name === "商户订单号（业务网站）")?.wide, "the merchant reference uses natural wrapping, not a forced whole row").toBe(false);
+        }
+      }
+    } finally {
+      await container.evaluate((element, width) => { (element as HTMLElement).style.width = width; }, originalWidth);
+      await page.evaluate(font => document.documentElement.style.fontSize = font, originalFont);
     }
-  } finally {
-    await container.evaluate((element, width) => { (element as HTMLElement).style.width = width; }, originalWidth);
-  }
-  await record(page, info, { feature: "detail-flow-container-breakpoints", boundaries, restoredInlineWidth: originalWidth });
-  await screenshot(page, info, "reading-flow-boundaries-restored");
+    return wrapping;
+  };
+  await openDetail(page, manifest, "notificationDns");
+  const wrapping = await checkWrapping(page.locator('[data-detail-order-summary] [data-detail-fields]'));
+  await record(page, info, { feature: "detail-flow-content-wrapping", wrapping });
+  await screenshot(page, info, "reading-flow-wrapping-restored");
 
   await openDetail(page, manifest, "matchSite");
   const flows = await readingFlowGeometry(page);
   const twoFacts = flows.find(group => group.fields.length === 2 && group.fields.map(field => field.name).join("/") === "关联方式/关联时间");
   expect(twoFacts, "the genuine inferred match has two short processing facts").toBeTruthy();
-  expect(twoFacts!.width).toBeGreaterThanOrEqual(840);
   expect(twoFacts!.rows).toEqual([["关联方式", "关联时间"]]);
-  for (const field of twoFacts!.fields) expect(field.width).toBeLessThan(twoFacts!.width / 3);
-  expect(twoFacts!.right - twoFacts!.fields.at(-1)!.right).toBeGreaterThan(200);
+  expect(twoFacts!.fields.every(field => field.inline), "both short facts keep their labels and values on one line").toBe(true);
+  const occupiedWidth = twoFacts!.fields.at(-1)!.right - twoFacts!.fields[0]!.left;
+  expect(twoFacts!.width - occupiedWidth, "two short facts leave unused space at the row end instead of stretching into halves").toBeGreaterThan(twoFacts!.rootFont);
   await record(page, info, { feature: "detail-flow-two-facts", evidence: "local-synthetic-domain", geometry: twoFacts });
   await screenshot(page, info, "reading-flow-two-facts");
 
   await openDetail(page, manifest, "ledgerAssociated");
-  const credentials = page.locator('[data-ledger-summary] [data-detail-credentials] [data-detail-fields]');
-  const originalCredentialsWidth = await credentials.evaluate(element => (element as HTMLElement).style.width);
-  const credentialBoundaries = [];
-  try {
-    for (const requestedWidth of [639, 640, 1024, 1280]) {
-      await credentials.evaluate((element, width) => { (element as HTMLElement).style.width = width + "px"; }, requestedWidth);
-      const geometry = (await readingCredentialsGeometry(page))[0]!;
-      expect(geometry.width).toBe(requestedWidth);
-      credentialBoundaries.push({ requestedWidth, columns: geometry.columns, fieldWidths: geometry.fields.map(field => field.width) });
-    }
-  } finally {
-    await credentials.evaluate((element, width) => { (element as HTMLElement).style.width = width; }, originalCredentialsWidth);
-  }
-  await record(page, info, { feature: "detail-credential-container-breakpoints", credentialBoundaries, restoredInlineWidth: originalCredentialsWidth });
+  const credentialWrapping = await checkWrapping(page.locator('[data-ledger-summary] [data-detail-credentials] [data-detail-fields]'));
+  await record(page, info, { feature: "detail-credential-content-wrapping", credentialWrapping });
 });
 
-test("three detail types retain expanded facts across widths, themes and content modes", async ({ page, manifest }, info) => {
-  test.setTimeout(600_000);
-  await login(page, manifest);
-  const errors: string[] = [];
-  page.on("pageerror", error => errors.push(error.message));
-  for (const width of [320, 390, 1440, 2190]) for (const theme of ["light", "dark"] as const) for (const mode of ["compact", "full"] as const) {
-    await page.setViewportSize({ width, height: 900 });
-    await layout(page, theme, mode);
-    for (const scenario of layoutScenarios) {
-      await openDetail(page, manifest, scenario.key);
-      await expect(page.getByRole("heading", { level: 1 })).toHaveText(scenario.heading);
-      await expect(page.getByRole("heading", { level: 1 })).toHaveCount(1);
-      await expect(page.locator("[data-content-width]")).toHaveAttribute("data-content-width", mode);
-      await expect(page.locator("html")).toHaveClass(theme === "dark" ? /dark/ : /^(?!.*\bdark\b)/);
-      if (scenario.kind === "notification") {
-        await fields(page, scenario.key === "notificationSite" ? ["下次重试", "通知地址"] : ["所属网站", "下次重试", "通知地址"]);
-        await expect(page.getByRole("heading", { name: "投递尝试（1）", exact: true })).toBeVisible();
-        await expect(page.getByText(/通知域名解析失败/).first()).toBeVisible();
-        await expect(page.locator("[data-detail-order-summary]")).toBeVisible();
-      } else if (scenario.kind === "match") {
-        await fields(page, ["支付宝交易金额", "支付宝交易时间", "支付宝交易对方", "支付宝订单号", "支付宝交易备注", "金额占用时间"]);
-        await expect(page.getByRole("heading", { name: "匹配依据", exact: true })).toBeVisible();
-        await expect(page.getByRole("button", { name: "匹配依据", exact: true })).toHaveCount(0);
-      } else {
-        await fields(page, ["支付宝流水号", "交易金额", "收支方向", "交易时间", "内部流水编号（PerPay）"]);
-        await expect(page.locator('#main-content dt').filter({ hasText: /^支付宝 App ID$/ })).toHaveCount(0);
-        for (const id of ["ledger-sources-heading", "ledger-matches-heading"]) await expect(page.locator("#" + id)).toBeVisible();
-        await expect(page.locator("#ledger-conflicts-heading")).toHaveCount(0);
-        await expect(page.locator("[data-ledger-source]").first()).toBeVisible();
-        await expect(page.locator("[data-ledger-match]").first()).toBeVisible();
-        await expect(page.locator('[data-ledger-summary] [data-detail-credentials]')).toBeVisible();
+test.describe("detail reading width matrix", () => {
+  // Give each viewport its own trace and let both workers share the 80 scenarios.
+  test.describe.configure({ mode: "parallel" });
+  for (const width of [320, 390, 1440, 2190]) {
+    test(`${width}px: three detail types retain expanded facts across themes and content modes`, async ({ page, manifest }, info) => {
+      test.setTimeout(600_000);
+      await login(page, manifest);
+      const errors: string[] = [];
+      page.on("pageerror", error => errors.push(error.message));
+      for (const theme of ["light", "dark"] as const) for (const mode of ["compact", "full"] as const) {
+        await page.setViewportSize({ width, height: 900 });
+        await layout(page, theme, mode);
+        for (const scenario of layoutScenarios) {
+          await openDetail(page, manifest, scenario.key);
+          await expect(foreground(page).getByRole("heading", { level: 1 })).toHaveText(scenario.heading);
+          await expect(foreground(page).getByRole("heading", { level: 1 })).toHaveCount(1);
+          await expect(page.locator("[data-content-width]")).toHaveAttribute("data-content-width", mode);
+          await expect(page.locator("html")).toHaveClass(theme === "dark" ? /dark/ : /^(?!.*\bdark\b)/);
+          if (scenario.kind === "notification") {
+            await fields(detailSection(page, "overview").locator("[data-notification-information]"), scenario.key === "notificationSite" ? ["下次重试", "通知地址"] : ["所属网站", "下次重试", "通知地址"]);
+            await expect(detailSection(page, "overview").locator("[data-detail-order-summary]")).toBeVisible();
+            await readDetailSection(page, "投递记录");
+            await expectAttemptHistory(detailSection(page, "attempts"), 1);
+            await expect(detailSection(page, "attempts").getByText(/通知域名解析失败/)).toBeVisible();
+            await readingLayout(page, mode, "投递尝试（1）");
+            await readDetailSection(page, "概况");
+          } else if (scenario.kind === "match") {
+            await fields(detailBody(page), ["支付宝交易金额", "支付宝交易时间", "支付宝交易对方", "支付宝订单号", "支付宝交易备注", "金额占用时间"]);
+            await expect(page.getByRole("heading", { name: "匹配依据", exact: true })).toBeVisible();
+            await expect(page.getByRole("button", { name: "匹配依据", exact: true })).toHaveCount(0);
+          } else {
+            await readDetailSection(page, "交易");
+            await fields(detailSection(page, "transaction"), ["支付宝流水号", "交易金额", "收支方向", "交易时间"]);
+            await expect(detailBody(page).locator('dt').filter({ hasText: /^支付宝 App ID$/ })).toHaveCount(0);
+            await expect(detailBody(page).locator('[data-ledger-summary] [data-detail-credentials]')).toBeVisible();
+            await readingCredentialsGeometry(page);
+            await readDetailSection(page, /^采集记录/);
+            await expect(detailBody(page).locator("#ledger-sources-heading")).toBeVisible();
+            await expect(detailBody(page).locator("[data-ledger-source]").first()).toBeVisible();
+            const sourceFacts = detailSection(page, "sources").locator("[data-ledger-source]").first()
+              .locator(':scope > [data-slot="item-content"] > [data-detail-fields], :scope > [data-slot="card-content"] > [data-detail-credentials]');
+            await fields(sourceFacts, ["内部流水编号（PerPay）"]);
+            await readingFlowGeometry(page);
+            await readDetailSection(page, "收款关联");
+            await expect(detailBody(page).locator("#ledger-matches-heading")).toBeVisible();
+            await expect(detailBody(page).locator("[data-ledger-match]").first()).toBeVisible();
+            await readingFlowGeometry(page);
+            await expect(detailSection(page, "conflicts")).toHaveCount(0);
+            await readDetailSection(page, "交易");
+          }
+          const flows = await readingFlowGeometry(page);
+          const geometry = await readingLayout(page, mode);
+          const technicalDialog = await keyboardTools(page, scenario.tools);
+          const id = `reading-${scenario.key}-${width}-${theme}-${mode}`;
+          const credentials = await readingCredentialsGeometry(page);
+          await record(page, info, { feature: "detail-reading-matrix", width, theme, mode, scenario: scenario.key, flows, credentials, geometry, technicalDialog, evidence: "local-synthetic-domain" });
+          await screenshot(page, info, id);
+          if (width === 320 && mode === "compact") await audit(page, info, id);
+        }
       }
-      const flows = await readingFlowGeometry(page);
-      const geometry = await readingLayout(page, mode);
-      if (width === 1440) await keyboardTools(page, scenario.tools);
-      const id = `reading-${scenario.key}-${width}-${theme}-${mode}`;
-      const credentials = await readingCredentialsGeometry(page);
-      await record(page, info, { feature: "detail-reading-matrix", width, theme, mode, scenario: scenario.key, flows, credentials, geometry, evidence: "local-synthetic-domain" });
-      await screenshot(page, info, id);
-      if (width === 320 && mode === "compact") await audit(page, info, id);
-    }
+      if (width === 2190) {
+        // Exercise the intermediate viewport as well as the explicit container
+        // widths above; each real fact group chooses its own natural wrapping.
+        await page.setViewportSize({ width: 1100, height: 900 });
+        await layout(page, "dark", "full");
+        await openDetail(page, manifest, "ledgerAssociated");
+        await readingFlowGeometry(page);
+        await page.setViewportSize({ width: 2190, height: 900 });
+        await openDetail(page, manifest, "ledgerAssociated");
+        await readingFlowGeometry(page);
+      }
+      expect(errors).toEqual([]);
+    });
   }
-  // Exercise the intermediate viewport as well as the explicit container
-  // boundaries above; each real fact group chooses its own natural wrapping.
-  await page.setViewportSize({ width: 1100, height: 900 });
-  await layout(page, "dark", "full");
-  await openDetail(page, manifest, "ledgerAssociated");
-  await readingFlowGeometry(page);
-  await page.setViewportSize({ width: 2190, height: 900 });
-  await openDetail(page, manifest, "ledgerAssociated");
-  await readingFlowGeometry(page);
-  expect(errors).toEqual([]);
 });
 
 test("coarse-pointer detail actions retain compact touch targets in both content modes", async ({ browser, manifest }, info) => {
@@ -386,8 +455,15 @@ test("coarse-pointer detail actions retain compact touch targets in both content
       await layout(page, "dark", mode);
       for (const scenario of scenarios) {
         await openDetail(page, manifest, scenario.key);
+        const headerGeometry = await headerControlsGeometry(page);
+        const header = foreground(page).locator('[data-overlay-primary] > [data-slot="dialog-header"]');
+        const refreshTouch = await expectTouchTarget(header.getByRole("button", { name: "刷新", exact: true }));
+        const closeTouch = await expectTouchTarget(header.getByRole("button", { name: "关闭对话框", exact: true }));
+        expect(Math.abs(refreshTouch.width - closeTouch.width)).toBeLessThanOrEqual(1);
+        expect(Math.abs(refreshTouch.height - closeTouch.height)).toBeLessThanOrEqual(1);
+        expect(Math.abs(refreshTouch.y + refreshTouch.height / 2 - closeTouch.y - closeTouch.height / 2)).toBeLessThanOrEqual(1);
         const targets = [];
-        for (const button of await page.locator('#main-content [class~="group/button"], #main-content [data-slot="button"]').all()) {
+        for (const button of await page.locator('[data-overlay-detail] [class~="group/button"], [data-overlay-detail] [data-slot="button"]').all()) {
           if (!await button.isVisible() || !await button.isEnabled()) continue;
           // Reveal the complete generated touch slot, including its margins.
           await button.evaluate(element => element.scrollIntoView({ block: "center", inline: "nearest" }));
@@ -395,7 +471,7 @@ test("coarse-pointer detail actions retain compact touch targets in both content
           targets.push(await expectTouchTarget(button));
         }
         expect(targets.length).toBeGreaterThan(0);
-        await record(page, info, { feature: "detail-touch-targets", width, mode, scenario: scenario.key, targets });
+        await record(page, info, { feature: "detail-touch-targets", width, mode, scenario: scenario.key, targets, headerGeometry, headerTargets: [refreshTouch, closeTouch] });
         await screenshot(page, info, `reading-touch-${scenario.key}-${width}-${mode}`);
       }
     }
@@ -411,7 +487,14 @@ test("named notification scenarios retain delivery facts and safe resend recover
     const card = page.getByRole("group", { name: "通知信息", exact: true });
     const history = page.getByRole("group", { name: "投递历史", exact: true });
     await expect(card.getByText(detail.target.target_url, { exact: true })).toBeVisible();
-    await expect(history.getByRole("heading", { name: `投递尝试（${detail.delivery.attempt_count}）`, exact: true })).toBeVisible();
+    await expect(card.locator('[data-slot="card-header"]').getByText(`已尝试 ${detail.delivery.attempt_count} 次`, { exact: true })).toBeVisible();
+    await expect(card.locator("dt").filter({ hasText: /^尝试次数$/ })).toHaveCount(0);
+    if (key === "notificationSite") {
+      const order = detailBody(page).locator('[data-detail-order-summary] [data-slot="item-title"] a');
+      expect(targetUrl(page, (await order.getAttribute("href"))!).pathname).toBe("/sites/" + detail.target.api_client_id + "/orders/" + detail.event.order_id);
+    }
+    await readDetailSection(page, "投递记录");
+    await expectAttemptHistory(history, detail.delivery.attempt_count);
     await expect(history.getByRole("button", { name: /^投递尝试（/ })).toHaveCount(0);
     if (key === "notificationPending") {
       expect(detail.delivery.attempt_count).toBe(0);
@@ -419,14 +502,13 @@ test("named notification scenarios retain delivery facts and safe resend recover
     }
     if (key === "notificationDns" || key === "notificationSite") await expect(history.getByText(/通知域名解析失败/)).toBeVisible();
     if (key === "notificationHttp") await expect(history.getByText(/HTTP 503/)).toBeVisible();
-    if (key === "notificationSite") await expect(page.getByRole("group", { name: "关联订单", exact: true }).locator('[data-detail-order-summary] a[href*="/orders/"]')).toHaveAttribute("href", new RegExp("^/admin/sites/" + detail.target.api_client_id + "/orders/"));
+    await readDetailSection(page, "概况");
     if (key === "notificationHistory") {
       expect(detail.is_latest).toBe(false);
       await expect(card.getByText(/历史投递/)).toBeVisible();
-      await card.getByRole("button", { name: "更多操作，通知记录操作", exact: true }).click();
-      await expect(page.getByRole("menuitem", { name: "重新发送", exact: true })).toHaveCount(0);
-      await page.keyboard.press("Escape");
-      await expect(page.getByRole("menu")).toHaveCount(0);
+      await expect(card.getByRole("button", { name: "重新发送", exact: true })).toHaveCount(0);
+      await expect(card.getByRole("button", { name: "更多操作，通知记录操作", exact: true })).toHaveCount(0);
+      await expect(card.getByRole("button", { name: "技术信息", exact: true })).toBeVisible();
     }
     if (key === "notificationDead") {
       const trigger = card.getByRole("button", { name: "重新发送", exact: true });
@@ -443,6 +525,53 @@ test("named notification scenarios retain delivery facts and safe resend recover
     }
     await record(page, info, { feature: "notification-domain-scenarios", key, attemptCount: detail.delivery.attempt_count, latest: detail.is_latest });
     await screenshot(page, info, "reading-" + key);
+  }
+});
+
+test("notification history loads after its delivery succeeds and does not reload when sections reflow", async ({ page, manifest }, info) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await login(page, manifest);
+  const route = detailPath(manifest, "notificationHttp"), deliveryPath = apiPath(route);
+  const detail = await data<WebhookDeliveryDetail>(page, manifest, deliveryPath);
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  let deliveryReads = 0, attemptReads = 0, available = true;
+  await page.route(manifest.origin + deliveryPath, async request => {
+    deliveryReads++;
+    await gate;
+    return available
+      ? request.fulfill({ status: 200, json: { data: detail } })
+      : request.fulfill({ status: 503, json: { error: { code: "synthetic_delivery_unavailable", message: "合成的通知详情读取失败" } } });
+  });
+  await page.route(manifest.origin + deliveryPath + "/attempts", request => { attemptReads++; return request.continue(); });
+  try {
+    await page.goto(manifest.origin + "/admin" + route);
+    await expect.poll(() => deliveryReads).toBe(1);
+    await expect(foreground(page).getByRole("heading", { level: 1 })).toHaveText("通知详情");
+    await page.clock.runFor(100);
+    expect(attemptReads, "history cannot start before the delivery read succeeds").toBe(0);
+    release();
+    await expect.poll(() => attemptReads).toBe(1);
+    await expectAttemptHistory(detailSection(page, "attempts"), detail.delivery.attempt_count);
+    await expect(detailSection(page, "overview").locator("[data-notification-information]")).toBeVisible();
+    for (const width of [390, 768, 1440]) {
+      await page.setViewportSize({ width, height: 900 });
+      await revealHistory();
+      expect({ deliveryReads, attemptReads }).toEqual({ deliveryReads: 1, attemptReads: 1 });
+    }
+    const successfulReads = { deliveryReads, attemptReads };
+    available = false;
+    attemptReads = 0;
+    await page.reload();
+    await expect(foreground(page).getByText("合成的通知详情读取失败", { exact: true })).toBeVisible();
+    expect(attemptReads, "a failed delivery never starts an unrelated attempt read").toBe(0);
+    await record(page, info, { feature: "notification-dependent-history-read", evidence: "gated local delivery response and real local attempts; no sends", successfulReads, failedDeliveryAttemptReads: attemptReads });
+  } finally { release(); }
+
+  async function revealHistory() {
+    await readDetailSection(page, "投递记录");
+    await expect(foreground(page).getByRole("tab")).toHaveCount(0);
+    await page.clock.runFor(100);
   }
 });
 
@@ -465,7 +594,8 @@ test("a clearly synthetic 21-attempt response stays expanded and pages newest-fi
   await page.route(manifest.origin + deliveryPath, route => route.fulfill({ status: 200, json: { data: detail } }));
   await page.route(manifest.origin + path, route => route.fulfill({ status: 200, json: { data: attempts } }));
   await openDetail(page, manifest, "notificationHttp");
-  await expect(page.getByText("已尝试 21 次", { exact: true })).toBeVisible();
+  await expect(detailBody(page).getByText("已尝试 21 次", { exact: true })).toBeVisible();
+  await readDetailSection(page, "投递记录");
   const table = page.getByRole("table", { name: "投递尝试（21）", exact: true });
   await expect(table).toBeVisible();
   await expect(page.getByRole("button", { name: "投递尝试（21）", exact: true })).toHaveCount(0);
@@ -499,21 +629,23 @@ test("failed attempt reads retain an accurate unknown history and recover on exp
       : route.fulfill({ status: 200, json: { data: original } });
   });
   await openDetail(page, manifest, "notificationHttp");
-  const main = page.locator("#main-content");
+  await readDetailSection(page, "投递记录");
+  const main = detailBody(page);
   const history = page.getByRole("group", { name: "投递历史", exact: true });
   await expect(history.getByText("发送记录读取失败，请重试；这不代表没有发送过。", { exact: true })).toBeVisible();
   await expect(history.locator('[data-slot="card-description"]')).toHaveText("发送记录读取失败");
   await expect(main.getByText("暂无尝试明细", { exact: true })).toHaveCount(0);
   await expect(main.getByRole("table", { name: /^投递尝试/ })).toHaveCount(0);
-  await expect(history.getByRole("alert")).toContainText("合成的投递尝试读取失败");
+  const alert = main.getByRole("alert", { name: "服务连接提示", exact: true });
+  await expect(alert).toContainText("合成的投递尝试读取失败");
   const beforeRetry = reads;
   unavailable = false;
-  await history.getByRole("button", { name: "重试", exact: true }).click();
+  await alert.getByRole("button", { name: "重试", exact: true }).click();
   await expect(main.getByRole("table", { name: "投递尝试（1）", exact: true })).toBeVisible();
-  await expect(main.getByText(/HTTP 503/)).toBeVisible();
+  await expect(history.getByText(/HTTP 503/)).toBeVisible();
   await expect(history.getByText("发送记录读取失败，请重试；这不代表没有发送过。", { exact: true })).toHaveCount(0);
   await expect(history.locator('[data-slot="card-description"]')).toHaveText("投递尝试按时间倒序显示 · 每页 10 条");
-  await expect(history.getByRole("alert")).toHaveCount(0);
+  await expect(alert).toHaveCount(0);
   expect(reads).toBeGreaterThan(beforeRetry);
   await record(page, info, { feature: "notification-attempt-read-recovery", evidence: "synthetic-unavailable-response-then-original-attempts", beforeRetry, afterRetry: reads });
   await screenshot(page, info, "reading-notification-attempt-read-recovered");
@@ -525,16 +657,20 @@ test("automatic, manual and reversed matches keep full evidence in unified and s
   for (const key of ["matchInferred", "matchManual", "matchReversed", "matchSite"]) {
     await openDetail(page, manifest, key);
     const match = await data<PaymentMatchDetail>(page, manifest, apiPath(detailPath(manifest, key)));
-    const card = page.getByRole("group", { name: "收款关联记录", exact: true });
     const scoped = key === "matchSite";
+    const card = scoped ? detailBody(page).getByRole("group", { name: "收款关联记录", exact: true })
+      : detailSection(page, "payments").locator(`[data-ledger-match="${match.payment_match_id}"]`).getByRole("group", { name: "收款关联记录", exact: true });
     const transaction = scoped ? page.getByRole("group", { name: "支付宝交易", exact: true }) : page.locator("[data-ledger-summary]");
     const evidence = scoped ? page.getByRole("group", { name: "匹配依据与处理记录", exact: true }) : card.locator("[data-match-evidence]");
     if (!scoped) {
-      await expect(page).toHaveURL(manifest.origin + "/admin/reconciliation/transactions/" + match.ledger_entry_id + "#match-" + match.payment_match_id);
+      await expectOverlayTarget(page, "/reconciliation/transactions/" + match.ledger_entry_id + "#match-" + match.payment_match_id);
       await expect(card.getByText("支付宝交易金额", { exact: true })).toHaveCount(0);
-      await expect(card.getByRole("link", { name: "核对这份记录", exact: true })).toHaveAttribute("href", /#source-/);
+      const sourceLink = card.getByRole("link", { name: "核对这份记录", exact: true });
+      expect(targetUrl(page, (await sourceLink.getAttribute("href"))!).hash).toBe("#source-" + match.ledger_entry_id);
     }
+    if (!scoped) await readDetailSection(page, "交易");
     await expect(transaction.getByText(match.ledger_entry.provider_order_no!, { exact: true })).toBeVisible();
+    if (!scoped) await readDetailSection(page, "收款关联");
     await expect(card.locator("[data-detail-order-summary]")).toContainText(match.order.merchant_order_no);
     if (match.candidate) {
       await expect(evidence.getByRole("heading", { name: "匹配依据", exact: true })).toBeVisible();
@@ -546,13 +682,12 @@ test("automatic, manual and reversed matches keep full evidence in unified and s
       await expect(evidence.locator("dd").filter({ hasText: match.creation_operation.reason! })).toBeVisible();
     }
     if (match.status === "REVERSED") {
-      await fields(page, ["撤销时间", "撤销操作人", "撤销理由"]);
+      await fields(evidence, ["撤销时间", "撤销操作人", "撤销理由"]);
       expect(match.resolution_operation?.reason).toBeTruthy();
       await expect(evidence.locator("dd").filter({ hasText: match.resolution_operation!.reason! })).toBeVisible();
-      await card.getByRole("button", { name: "更多操作，收款关联记录操作", exact: true }).click();
+      await expect(card.getByRole("button", { name: "更多操作，收款关联记录操作", exact: true })).toHaveCount(0);
       await expect(page.getByRole("menuitem", { name: "撤销错误关联", exact: true })).toHaveCount(0);
-      await page.keyboard.press("Escape");
-      await expect(page.getByRole("menu")).toHaveCount(0);
+      await expect(card.getByRole("button", { name: "技术信息", exact: true })).toBeVisible();
     } else {
       const trigger = card.getByRole("button", { name: "更多操作，收款关联记录操作", exact: true });
       await trigger.click();
@@ -565,8 +700,9 @@ test("automatic, manual and reversed matches keep full evidence in unified and s
       await expect(dialog).toHaveCount(0);
       await expect(trigger).toBeFocused();
     }
-    const orderPrefix = scoped ? "/admin/sites/" + match.order.api_client_id : "/admin";
-    await expect(card.locator('[data-detail-order-summary] a[href*="/orders/"]')).toHaveAttribute("href", orderPrefix + "/orders/" + match.order_id);
+    const orderPrefix = scoped ? "/sites/" + match.order.api_client_id : "";
+    const orderLink = card.locator('[data-detail-order-summary] [data-slot="item-title"] a');
+    expect(targetUrl(page, (await orderLink.getAttribute("href"))!).pathname).toBe(orderPrefix + "/orders/" + match.order_id);
     await record(page, info, { feature: "match-domain-scenarios", key, evidenceType: match.evidence_type, status: match.status });
     await screenshot(page, info, "reading-" + key);
   }
@@ -578,29 +714,41 @@ test("all genuine ledger versions and synthetic simultaneous associations remain
   for (const key of ["ledgerAssociated", "ledgerIdentical", "ledgerDisputed"]) {
     const entry = await data<AdminLedgerDetail>(page, manifest, apiPath(detailPath(manifest, key)));
     await openDetail(page, manifest, key);
-    await expect(page.locator("[data-ledger-source]")).toHaveCount(entry.sources.length);
-    await expect(page.locator("[data-ledger-match]")).toHaveCount(entry.matches.length);
-    await expect(page.locator("[data-ledger-conflict]")).toHaveCount(entry.conflicts.length);
-    await expect(page.locator("[data-detail-credentials]")).toHaveCount(1 + (entry.content_consistent ? 0 : entry.sources.length) + entry.conflicts.length);
-    for (const source of entry.sources) await expect(page.locator(`[data-ledger-source="${source.ledger_entry_id}"]`).getByText(source.ledger_entry_id, { exact: true })).toBeVisible();
+    await expect(detailSection(page, "transaction").locator("[data-detail-credentials]")).toHaveCount(1);
+    if (key === "ledgerDisputed") await expect(detailBody(page).locator("[data-ledger-summary]")).toContainText("有争议");
+    await readDetailSection(page, "收款关联");
+    await expect(detailBody(page).locator("[data-ledger-match]")).toHaveCount(entry.matches.length);
+    if (entry.conflicts.length) {
+      await readDetailSection(page, /^冲突/);
+      await expect(detailBody(page).locator("[data-ledger-conflict]")).toHaveCount(entry.conflicts.length);
+      await expect(detailSection(page, "conflicts").locator("[data-detail-credentials]")).toHaveCount(entry.conflicts.length);
+    } else await expect(detailSection(page, "conflicts")).toHaveCount(0);
+    await readDetailSection(page, /^采集记录/);
+    await expect(detailBody(page).locator("[data-ledger-source]")).toHaveCount(entry.sources.length);
+    await expect(detailSection(page, "sources").locator('[data-ledger-source] > [data-slot="card-content"] > [data-detail-credentials]')).toHaveCount(entry.content_consistent ? 0 : entry.sources.length);
+    for (const source of entry.sources) {
+      const facts = page.locator(`[data-ledger-source="${source.ledger_entry_id}"]`)
+        .locator(':scope > [data-slot="item-content"] > [data-detail-fields], :scope > [data-slot="card-content"] > [data-detail-credentials]');
+      await expect(facts.getByText(source.ledger_entry_id, { exact: true })).toBeVisible();
+    }
     if (key === "ledgerIdentical") { expect(entry.content_consistent).toBe(true); expect(entry.sources.length).toBeGreaterThan(1); }
     if (key === "ledgerDisputed") {
       expect(entry.content_consistent).toBe(false);
       await expect(page.locator("[data-ledger-warning]")).toContainText("账单记录有差异");
-      await expect(page.locator("[data-ledger-summary]")).toContainText("有争议");
       for (const source of entry.sources) {
         const card = page.locator(`[data-ledger-source="${source.ledger_entry_id}"]`);
-        await expect(card.locator('[data-layout="flow"] dt')).toHaveText(["交易金额", "收支方向", "交易时间", "对方", "保存时间", "支付宝备注"]);
-        if (source.memo) await expect(card.getByText(source.memo, { exact: true })).toBeVisible();
-        if (source.provider_order_no) await expect(card.getByText(source.provider_order_no, { exact: true })).toBeVisible();
+        const facts = card.locator(':scope > [data-slot="card-content"] > [data-detail-fields]');
+        await expect(facts.locator("dt")).toHaveText([...(entry.sources.length === 1 ? ["PerPay 记录状态"] : []), "交易金额", "收支方向", "交易时间", "对方", "保存时间", "支付宝备注"]);
+        if (source.memo) await expect(facts.getByText(source.memo, { exact: true })).toBeVisible();
+        if (source.provider_order_no) await expect(card.locator(':scope > [data-slot="card-content"] > [data-detail-credentials]').getByText(source.provider_order_no, { exact: true })).toBeVisible();
       }
     } else {
       for (const source of entry.sources) {
         const card = page.locator(`[data-ledger-source="${source.ledger_entry_id}"]`);
-        await expect(card.locator("[data-detail-fields]").first().locator("dt")).toHaveText(["内部流水编号（PerPay）", "保存时间"]);
+        await expect(card.locator(':scope > [data-slot="item-content"] > [data-detail-fields] dt')).toHaveText([...(entry.sources.length === 1 ? ["PerPay 记录状态"] : []), "内部流水编号（PerPay）", "保存时间"]);
         await expect(card.getByRole("link", { name: "查看记录与处理", exact: true })).toHaveCount(0);
         const eligible = source.direction === "CREDIT" && ["UNALLOCATED", "CANDIDATE", "CONFLICT"].includes(source.state);
-        const actions = card.locator('[data-slot="item-actions"], [data-slot="card-action"]').first();
+        const actions = entry.sources.length === 1 ? card.locator(':scope > [data-slot="item-content"] > div.flex.max-w-full') : card.locator(':scope > [data-slot="item-content"] > [data-slot="item-header"] > [data-slot="item-actions"], :scope > [data-slot="card-header"] > [data-slot="card-action"]');
         await expect(actions.getByRole("button", { name: "人工关联收款", exact: true })).toHaveCount(eligible ? 1 : 0);
       }
     }
@@ -623,11 +771,13 @@ test("all genuine ledger versions and synthetic simultaneous associations remain
   await openDetail(page, manifest, "ledgerAssociated");
   await expect(page.locator("[data-ledger-warning]")).toContainText(`有 ${entry.active_match_count} 条有效关联`);
   await expect(page.locator("[data-ledger-warning]")).toContainText("无法确定唯一订单");
-  await expect(page.locator("[data-ledger-match]")).toHaveCount(entry.matches.length);
-  await expect(page.getByText("当前实际关联", { exact: true })).toHaveCount(0);
+  await readDetailSection(page, "收款关联");
+  await expect(detailBody(page).locator("[data-ledger-match]")).toHaveCount(entry.matches.length);
+  await expect(detailBody(page).getByText("当前实际关联", { exact: true })).toHaveCount(0);
   for (const match of [settled!, second]) {
     const card = page.locator(`[data-ledger-match="${match.payment_match_id}"]`);
-    await expect(card.locator('[data-detail-order-summary] a[href*="/orders/"]')).toHaveAttribute("href", "/admin/orders/" + match.order_id);
+    const orderLink = card.locator('[data-detail-order-summary] [data-slot="item-title"] a');
+    expect(targetUrl(page, (await orderLink.getAttribute("href"))!).pathname).toBe("/orders/" + match.order_id);
     await expect(card.getByText("仍生效 · 存在多条关联", { exact: true })).toBeVisible();
   }
   await record(page, info, { feature: "ledger-multiple-associations", evidence: "synthetic-detail-response-only", activeMatchCount: entry.active_match_count });
@@ -647,31 +797,29 @@ test("technical record identifiers remain copyable without crowding the business
     { key: "notificationDns", tools: "更多操作，通知记录操作", values: [["投递编号", notification.delivery.delivery_id], ["事件编号", notification.event.event_id]] },
     { key: "matchInferred", tools: "更多操作，收款关联记录操作", values: [["关联编号", match.payment_match_id], ["流水编号", match.ledger_entry_id]] },
     { key: "ledgerAssociated", tools: "更多操作，支付宝流水记录操作", values: [["内部流水编号（PerPay）", ledger.ledger_entry_id]] },
-    { key: "ledgerAssociated", tools: "更多操作，查账记录 1 操作", values: [["支付宝 App ID", source.app_id], ["采集来源标识", source.provider_account_key]] },
+    { key: "ledgerAssociated", tools: "更多操作，查账记录 1 操作", sourceId: source.ledger_entry_id, values: [["支付宝 App ID", source.app_id], ["采集来源标识", source.provider_account_key]] },
   ];
   for (const scenario of cases) {
     await openDetail(page, manifest, scenario.key);
-    await expect(page.locator('#main-content dt').filter({ hasText: /^支付宝 App ID$/ })).toHaveCount(0);
-    const trigger = page.getByRole("button", { name: scenario.tools, exact: true });
-    await trigger.focus();
-    await page.keyboard.press("Enter");
-    const menu = page.getByRole("menu");
-    await expect(menu).toBeVisible();
-    await menu.getByRole("menuitem", { name: "技术详情", exact: true }).click();
-    const dialog = page.getByRole("dialog", { name: "技术详情", exact: true });
-    await expect(dialog).toBeVisible();
-    await expect(dialog.getByRole("heading", { name: "技术详情", exact: true })).toBeFocused();
+    await expect(detailBody(page).locator('dt').filter({ hasText: /^支付宝 App ID$/ })).toHaveCount(0);
+    const technical = await technicalSection(page, scenario.tools, "sourceId" in scenario ? scenario.sourceId : undefined);
+    const session = await openTechnicalDialog(page, technical);
+    await page.keyboard.press("Tab");
+    await expect(session.close).toBeFocused();
+    await page.keyboard.press("Tab");
+    await expect(session.body.getByRole("button", { name: /^复制/ }).first()).toBeFocused();
     for (const [name, value] of scenario.values) {
       expect(value, name).toBeTruthy();
-      await dialog.getByRole("button", { name: "复制" + name, exact: true }).click();
+      await expect(session.body.getByText(value!, { exact: true })).toBeVisible();
+      await session.body.getByRole("button", { name: "复制" + name, exact: true }).click();
       await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe(value);
     }
-    await record(page, info, { feature: "detail-technical-identifiers", scenario: scenario.key, tools: scenario.tools, copiedFields: scenario.values.map(([name]) => name), evidence: "local-synthetic-domain" });
+    const secondary = await expectTechnicalDialogLayout(session);
     await screenshot(page, info, "reading-technical-" + scenario.tools);
-    await dialog.getByRole("button", { name: "关闭", exact: true }).click();
-    await expect(dialog).toHaveCount(0);
-    await expect(menu).toHaveCount(0);
-    await expect(trigger).toBeFocused();
+    const restored = await closeTechnicalDialog(session);
+    await expect(detailBody(page).locator('dt').filter({ hasText: /^支付宝 App ID$/ })).toHaveCount(0);
+    await record(page, info, { feature: "detail-technical-identifiers", scenario: scenario.key, tools: scenario.tools,
+      copiedFields: scenario.values.map(([name]) => name), secondary, parentOpened: session.opened, restored, evidence: "local-synthetic-domain" });
   }
 });
 
@@ -725,12 +873,20 @@ test("long products, complete identifiers and multiline details wrap without cli
     await page.route(manifest.origin + path, route => route.fulfill({ status: 200, json: { data: full } }));
   }
   await page.context().grantPermissions(["clipboard-read", "clipboard-write"], { origin: manifest.origin });
-  for (const width of [320, 1440]) for (const theme of ["light", "dark"] as const) {
+  for (const width of [320, 390, 1440]) for (const theme of ["light", "dark"] as const) {
     await page.setViewportSize({ width, height: 900 });
     await layout(page, theme, "compact");
     for (const scenario of scenarios) {
       await openDetail(page, manifest, scenario.key);
-      const title = page.locator('[data-detail-order-summary] [data-slot="item-title"]').first();
+      if (scenario.kind === "ledger") await readDetailSection(page, "收款关联");
+      const orderOwner = scenario.kind === "ledger"
+        ? detailSection(page, "payments").locator(`[data-ledger-match="${ledger.matches[0]!.payment_match_id}"]`)
+        : scenario.kind === "notification" ? detailSection(page, "overview").getByRole("group", { name: "关联订单", exact: true })
+          : detailBody(page).getByRole("group", { name: "收款关联记录", exact: true });
+      const factsOwner = scenario.kind === "ledger" ? detailSection(page, "transaction").locator("[data-ledger-summary]")
+        : scenario.kind === "notification" ? detailSection(page, "overview").locator("[data-notification-information]")
+          : detailBody(page).getByRole("group", { name: "支付宝交易", exact: true });
+      const title = orderOwner.locator('[data-detail-order-summary] [data-slot="item-title"]');
       await expect(title).toHaveText(product);
       const bounds = await title.evaluate(element => {
         const range = document.createRange(); range.selectNodeContents(element);
@@ -739,13 +895,14 @@ test("long products, complete identifiers and multiline details wrap without cli
       });
       expect(bounds.textHeight).toBeLessThanOrEqual(bounds.boxHeight + 1);
       expect(bounds.textRight).toBeLessThanOrEqual(bounds.boxRight + 1);
-      await expect(page.locator("dd").filter({ hasText: "第三行：可见末尾标记" }).first()).toHaveText(memo);
+      if (scenario.kind === "ledger") await readDetailSection(page, "交易");
+      await expect(factsOwner.locator("dd").filter({ hasText: "第三行：可见末尾标记" })).toHaveText(memo);
       if (scenario.kind === "notification") {
-        await expect(page.getByText(targetUrl, { exact: true })).toBeVisible();
-        await page.getByRole("button", { name: "复制通知地址", exact: true }).click();
+        await expect(factsOwner.getByText(targetUrl, { exact: true })).toBeVisible();
+        await factsOwner.getByRole("button", { name: "复制通知地址", exact: true }).click();
         await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe(targetUrl);
       } else {
-        await expect(page.getByText(identifier, { exact: true }).first()).toBeVisible();
+        await expect(factsOwner.getByText(identifier, { exact: true })).toBeVisible();
         if (scenario.kind === "ledger") {
           for (const [name, value] of [["支付宝流水号", externalIdentifier], ["支付宝订单号", identifier], ["支付宝商户单号", merchantIdentifier]]) {
             const credential = page.locator('[data-ledger-summary] [data-detail-credentials]');
@@ -758,20 +915,16 @@ test("long products, complete identifiers and multiline details wrap without cli
       const longFacts = scenario.kind === "notification" ? [["所属网站", siteName]] : scenario.kind === "match" ? [["所属网站", siteName], ["支付宝交易对方", counterparty]] : [["对方", counterparty]];
       const wrappedFacts = [];
       for (const [name, value] of longFacts) {
-        const field = page.locator("#main-content dt").filter({ hasText: new RegExp("^" + name + "$") }).first().locator("..");
+        const fieldOwner = name === "所属网站" && scenario.kind === "match" ? orderOwner : factsOwner;
+        const field = fieldOwner.locator("dt").filter({ hasText: new RegExp("^" + name + "$") }).locator("..");
         await expect(field).not.toHaveAttribute("data-field-wide", "true");
         await expect(field.locator("dd")).toHaveText(value!);
-        const wrapped = await field.evaluate(element => {
-          const definition = element.querySelector("dd")!;
-          const range = document.createRange(); range.selectNodeContents(definition);
-          const text = range.getBoundingClientRect(), box = definition.getBoundingClientRect();
-          return { name: element.querySelector("dt")!.textContent, fieldWidth: element.getBoundingClientRect().width,
-            valueHeight: box.height, lineHeight: Number.parseFloat(getComputedStyle(definition).lineHeight), textRight: text.right, boxRight: box.right, textBottom: text.bottom, boxBottom: box.bottom };
+        const wrapped = await field.evaluate(completeFieldGeometry);
+        expect(wrapped.characterText).toBe(value!.replace(/\s/gu, ""));
+        if (wrapped.hangingWhitespace.length || wrapped.textRight > wrapped.boxRight + 1) await info.attach(`text-bounds-${scenario.key}-${width}-${theme}-${name}`, {
+          body: JSON.stringify(wrapped, null, 2), contentType: "application/json",
         });
-        if (width === 1440) {
-          expect(wrapped.fieldWidth).toBeGreaterThanOrEqual(191);
-          expect(wrapped.fieldWidth).toBeLessThanOrEqual(257);
-        }
+        expect(wrapped.fieldWidth, "long facts wrap inside their available content width").toBeLessThanOrEqual(wrapped.containerWidth + 1);
         expect(wrapped.valueHeight).toBeGreaterThan(wrapped.lineHeight * 2);
         expect(wrapped.textRight).toBeLessThanOrEqual(wrapped.boxRight + 1);
         expect(wrapped.textBottom).toBeLessThanOrEqual(wrapped.boxBottom + 1);

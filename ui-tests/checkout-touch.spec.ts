@@ -34,7 +34,7 @@ test.describe("touch and reduced motion", () => {
     const amount = body.locator("p").first();
     await amount.scrollIntoViewIfNeeded();
     await expect(amount).toBeInViewport();
-    const image = body.locator("[data-qr-dialog-image]");
+    const image = dialog.locator("[data-qr-dialog-image]");
     await image.scrollIntoViewIfNeeded();
     await expect(image).toBeInViewport();
     await dialog.locator("[data-qr-dialog-body]").evaluate(element => element.scrollTop = element.scrollHeight);

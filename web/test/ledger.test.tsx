@@ -79,7 +79,7 @@ describe("administrator ledger pages", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
-  it("keeps full identifiers and order navigation available when changing from the desktop table to narrow summaries", async () => {
+  it("keeps full identifiers and compact summaries while retaining desktop-only column preferences", async () => {
     mobileMedia(1440);
     let width = 1088;
     const original = HTMLElement.prototype.getBoundingClientRect;
@@ -96,8 +96,8 @@ describe("administrator ledger pages", () => {
     expect(within(table).getByText("1 条已撤销关联")).toBeVisible();
     expect(table.querySelector('thead [data-column-id="memo"]')).toBeNull();
     const user = userEvent.setup();
-    await user.click(screen.getByRole("button", { name: "显示列" }));
-    await user.click(await screen.findByRole("menuitemcheckbox", { name: "备注" }));
+    await user.click(screen.getByRole("button", { name: "列表显示" }));
+    await user.click(await screen.findByRole("checkbox", { name: "备注" }));
     expect(within(table).getByRole("columnheader", { name: "备注" })).toBeVisible();
     await user.keyboard("{Escape}");
     act(() => { width = 600; window.dispatchEvent(new Event("resize")); });
@@ -105,12 +105,13 @@ describe("administrator ledger pages", () => {
     const summary = await screen.findByRole("listitem");
     expect(within(summary).getByText("关联状态")).toBeVisible();
     expect(within(summary).getByRole("link", { name: externalEventId })).toHaveTextContent(externalEventId);
-    expect(within(summary).getByRole("link", { name: "查看订单：real-order" })).toHaveAttribute("href", "/orders/" + orderId);
-    expect(within(summary).getByText("PerPay 处理状态")).toBeVisible();
+    expect(within(summary).getByText("交易时间")).toBeVisible();
+    expect(within(summary).getByText("收支")).toBeVisible();
+    expect(within(summary).queryByRole("link", { name: "查看订单：real-order" })).not.toBeInTheDocument();
+    expect(within(summary).queryByText("PerPay 处理状态")).not.toBeInTheDocument();
     expect(within(summary).queryByText("本地流水备注")).not.toBeInTheDocument();
-    await user.click(within(summary).getByRole("button", { name: "展开信息" }));
-    expect(within(summary).getByText("本地流水备注")).toBeVisible();
-    expect(within(summary).getAllByText("本地流水备注")).toHaveLength(1);
+    expect(within(summary).queryByRole("button", { name: "展开信息" })).not.toBeInTheDocument();
+    expect(summary.querySelectorAll(".business-summary-field")).toHaveLength(3);
     expect(JSON.parse(localStorage.getItem("perpay.table-columns.v2.administrator-ledger")!)).toEqual({ memo: true });
     expect(screen.getByLabelText("位置")).toHaveTextContent(/^\/reconciliation$/);
     expect(fetchMock).toHaveBeenCalledTimes(1);
@@ -120,6 +121,7 @@ describe("administrator ledger pages", () => {
     const router = mount("/reconciliation?cursor=page-two&page=2");
     await screen.findByRole("link", { name: entry.external_event_id });
     const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: "高级筛选" }));
     await user.click(screen.getByRole("button", { name: "金额范围" }));
     const dialog = await screen.findByRole("dialog", { name: "金额范围" });
     await user.type(within(dialog).getByLabelText("最低金额（元）"), "0.001");
@@ -141,7 +143,7 @@ describe("administrator ledger pages", () => {
     mount("/reconciliation?min_amount_cents=1.01");
     expect(await screen.findByText("金额筛选无效，请重新设置金额范围。")).toBeVisible();
     expect(fetchMock).not.toHaveBeenCalled();
-    fireEvent.click(screen.getByRole("button", { name: "清除筛选" }));
+    fireEvent.click(screen.getByRole("button", { name: "清除搜索和筛选" }));
     await screen.findByRole("link", { name: entry.external_event_id });
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
@@ -160,7 +162,7 @@ describe("administrator ledger pages", () => {
     const link = await screen.findByRole("link", { name: entry.external_event_id });
     vi.stubGlobal("scrollY", 725);
     await user.click(link);
-    await screen.findByRole("heading", { name: "查账记录（2）" });
+    await screen.findByRole("heading", { name: "支付宝交易" });
     refreshFails = true;
     vi.stubGlobal("scrollY", 0);
     await user.click(screen.getByRole("link", { name: "对账" }));
@@ -169,13 +171,15 @@ describe("administrator ledger pages", () => {
     await waitFor(() => expect(scroll).toHaveBeenCalledWith({ top: 725, left: 0, behavior: "instant" }));
   });
 
-  it("displays every source and reversed match with links to real evidence IDs", async () => {
-    mount("/reconciliation/transactions/" + ledgerId);
+  it("displays every detail section together and reads each source and match only once", async () => {
+    const router = mount("/reconciliation/transactions/" + ledgerId);
+    await screen.findByRole("heading", { name: "支付宝交易" });
+    expect(document.querySelector("[data-ledger-summary]")).not.toHaveTextContent("real-order");
     expect(await screen.findByRole("heading", { name: "查账记录（2）" })).toBeVisible();
-    await screen.findByRole("heading", { name: "当前关联订单" });
-    await screen.findByRole("heading", { name: "已撤销的关联" });
     expect(document.getElementById("source-" + ledgerId)).toBeVisible();
     expect(document.getElementById("source-" + secondSourceId)).toBeVisible();
+    await screen.findByRole("heading", { name: "当前关联订单" });
+    await screen.findByRole("heading", { name: "已撤销的关联" });
     expect(screen.getByText("已撤销", { exact: true })).toBeVisible();
     expect(screen.getAllByRole("link", { name: "核对这份记录" }).every(link => link.getAttribute("href")?.endsWith("#source-" + secondSourceId))).toBe(true);
     expect(screen.queryByRole("button", { name: /人工关联收款|确认收款/ })).not.toBeInTheDocument();
@@ -189,8 +193,78 @@ describe("administrator ledger pages", () => {
       expect(within(card).getByRole("link", { name: "实际关联商品" })).toHaveAttribute("href", "/orders/" + orderId);
       expect(within(card).getByText("real-order", { exact: true })).toBeVisible();
     }
-    expect(document.querySelector("[data-ledger-summary]")).not.toHaveTextContent("real-order");
+    expect(document.querySelector("[data-ledger-summary]")).toBeVisible();
+    expect(screen.queryByRole("tablist")).not.toBeInTheDocument();
+    for (const name of ["支付宝交易", "对应订单", "查账记录（2）"]) {
+      expect(screen.getAllByRole("heading", { name })).toHaveLength(1);
+      expect(screen.getByRole("heading", { name })).toBeVisible();
+    }
     expect(screen.queryByText(/账本冲突记录（/)).not.toBeInTheDocument();
+    await waitFor(() => expect(queryClient.isFetching()).toBe(0));
+    const reads = fetchMock.mock.calls.map(([request]) => new URL(request.url).pathname);
+    expect(reads).toHaveLength(5);
+    expect(new Set(reads).size).toBe(reads.length);
+    await userEvent.setup().click(screen.getByRole("button", { name: "切换网站记忆" }));
+    expect(router.state.location.search).toContain("selected_site=site-b");
+    expect(document.querySelector('[data-ledger-match="' + match.payment_match_id + '"]')).toBe(settledCard);
+    expect(fetchMock).toHaveBeenCalledTimes(5);
+  });
+
+  it("keeps legacy evidence hashes usable while all sections stay mounted", async () => {
+    const scroll = vi.spyOn(HTMLElement.prototype, "scrollIntoView");
+    const anchor = "match-" + match.payment_match_id;
+    const router = mount("/reconciliation/transactions/" + ledgerId + "?section=sources#" + anchor);
+    await screen.findByRole("heading", { name: "当前关联订单" });
+    await waitFor(() => expect(queryClient.isFetching()).toBe(0));
+    const associated = document.getElementById(anchor)!;
+    await waitFor(() => expect(associated).toHaveFocus());
+    expect(scroll.mock.contexts).toContain(associated);
+    expect(router.state.location.hash).toBe("#" + anchor);
+    for (const name of ["支付宝交易", "对应订单", "查账记录（2）"]) {
+      expect(screen.getByRole("heading", { name })).toBeVisible();
+    }
+    await userEvent.setup().click(within(associated).getByRole("link", { name: "核对这份记录" }));
+    await waitFor(() => expect(router.state.location.hash).toBe("#source-" + secondSourceId));
+    await waitFor(() => expect(document.getElementById("source-" + secondSourceId)).toHaveFocus());
+    expect(fetchMock).toHaveBeenCalledTimes(5);
+    expect(screen.queryByRole("tablist")).not.toBeInTheDocument();
+  });
+
+  it.each(["match", "source"] as const)("locates an asynchronous %s once and leaves focus alone when later evidence arrives", async kind => {
+    const scroll = vi.spyOn(HTMLElement.prototype, "scrollIntoView");
+    const originalFetch = fetchMock.getMockImplementation()!;
+    const anchor = kind === "match" ? "match-" + match.payment_match_id : "source-" + ledgerId;
+    const targetSuffix = kind === "match" ? "/matches/" + match.payment_match_id : "/ledger-entries/" + ledgerId + "/candidates";
+    const lateSuffix = "/ledger-entries/" + secondSourceId + "/candidates";
+    let finishTarget!: (response: Response) => void;
+    let finishLate!: (response: Response) => void;
+    const targetResponse = new Promise<Response>(resolve => { finishTarget = resolve; });
+    const lateResponse = new Promise<Response>(resolve => { finishLate = resolve; });
+    fetchMock.mockImplementation(async request => {
+      const path = new URL(request.url).pathname;
+      if (path.endsWith(targetSuffix)) return targetResponse;
+      if (path.endsWith(lateSuffix)) return lateResponse;
+      return originalFetch(request);
+    });
+    mount("/reconciliation/transactions/" + ledgerId + "#" + anchor);
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(5));
+    const target = document.getElementById(anchor)!;
+    expect(target).not.toHaveFocus();
+    expect(scroll).not.toHaveBeenCalled();
+    const request = fetchMock.mock.calls.find(([request]) => new URL(request.url).pathname.endsWith(targetSuffix))![0];
+    await act(async () => { finishTarget(await originalFetch(request)); });
+    await waitFor(() => expect(target).toHaveFocus());
+    expect(scroll.mock.contexts).toEqual([target]);
+    expect(queryClient.isFetching()).toBe(1);
+
+    const readingElsewhere = screen.getByRole("button", { name: "切换网站记忆" });
+    readingElsewhere.focus();
+    await act(async () => { finishLate(json({ data: [] })); });
+    await waitFor(() => expect(queryClient.isFetching()).toBe(0));
+    await act(() => new Promise<void>(resolve => requestAnimationFrame(() => resolve())));
+    expect(readingElsewhere).toHaveFocus();
+    expect(scroll.mock.contexts).toEqual([target]);
+    expect(fetchMock).toHaveBeenCalledTimes(5);
   });
 
   it("renders disputed facts without inventing zero or selecting a settled match", async () => {

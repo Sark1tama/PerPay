@@ -4,6 +4,7 @@ import {
   fireEvent,
   screen,
   waitFor,
+  within,
 } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -65,7 +66,10 @@ describe("homepage collection health", () => {
           ? apiError("internal_error", "unavailable", 503)
           : undefined,
     });
-    expect(await screen.findByText("需关注")).toBeVisible();
+    const status = await within(await screen.findByRole("navigation", { name: "全局管理" })).findByRole("link", { name: "运行状态" });
+    await waitFor(() => expect(status).toHaveAccessibleDescription("有运行告警"));
+    expect(status.querySelector("[data-runtime-notice] svg")).toBeInTheDocument();
+    expect(status).not.toHaveTextContent("需关注");
     expect(screen.queryByText("可以收款，有运行告警")).not.toBeInTheDocument();
     expect(screen.queryByText("已暂停接收新订单")).not.toBeInTheDocument();
     fail = true;
@@ -74,8 +78,9 @@ describe("homepage collection health", () => {
         queryKey: ["status", "shared"],
       });
     });
-    expect(await screen.findByText("暂时无法读取收款服务状态")).toBeVisible();
-    expect(screen.getByText("状态未知")).toBeVisible();
+    expect(await screen.findByRole("alert", { name: "服务连接提示" })).toHaveTextContent("服务处理失败，请稍后重试。");
+    expect(status).toHaveAccessibleDescription("状态未知");
+    expect(status.querySelector("[data-runtime-notice] svg")).toBeInTheDocument();
     expect(screen.queryByText("可以收款，有运行告警")).not.toBeInTheDocument();
   });
   it("invalidates health immediately when offline", async () => {
@@ -85,11 +90,13 @@ describe("homepage collection health", () => {
       path: "/",
       status: (settings) => ({ ...systemStatus(settings), status: "degraded" }),
     });
-    await screen.findByText("需关注");
+    const status = await within(await screen.findByRole("navigation", { name: "全局管理" })).findByRole("link", { name: "运行状态" });
+    await waitFor(() => expect(status).toHaveAccessibleDescription("有运行告警"));
     online.mockReturnValue(false);
     fireEvent(window, new Event("offline"));
-    expect(screen.getByText("暂时无法读取收款服务状态")).toBeVisible();
-    expect(screen.getByText("状态未知")).toBeVisible();
+    expect(screen.getByRole("status", { name: "服务连接提示" })).toHaveTextContent("等待网络恢复");
+    expect(status).toHaveAccessibleDescription("状态未知");
+    expect(status.querySelector("[data-runtime-notice] svg")).toBeInTheDocument();
     expect(screen.queryByText("可以收款，有运行告警")).not.toBeInTheDocument();
   });
   it("polls while visible, pauses while hidden, and reads afresh on return", async () => {
@@ -218,14 +225,14 @@ describe("list navigation continuity", () => {
     await screen.findByRole("link", { name: "第二页订单" });
     await userEvent
       .setup()
-      .click(screen.getByRole("button", { name: "清除筛选" }));
+      .click(screen.getByRole("button", { name: "清除搜索和筛选" }));
     expect(
       await screen.findByRole("link", { name: "第一页订单" }),
     ).toBeVisible();
     expect(view.router.state.location.search).toBe("?source=overview");
   });
 
-  it.each(["page link", "browser back"])(
+  it.each(["overlay close", "browser back"])(
     "restores page two and filters via %s",
     async (returnMethod) => {
       const view = mountOnboarding({
@@ -237,8 +244,8 @@ describe("list navigation continuity", () => {
       await user.click(await screen.findByRole("button", { name: "下一页" }));
       await user.click(await screen.findByRole("link", { name: "第二页订单" }));
       await screen.findByRole("heading", { name: order.product_name });
-      if (returnMethod === "page link")
-        await user.click(screen.getByRole("link", { name: "订单列表" }));
+      if (returnMethod === "overlay close")
+        await user.click(screen.getByRole("button", { name: "关闭对话框" }));
       else
         await act(async () => {
           await view.router.navigate(-1);
@@ -248,6 +255,7 @@ describe("list navigation continuity", () => {
       ).toBeVisible();
       expect(screen.getByText("第 2 页 · 本页 1 条")).toBeVisible();
       expect(screen.getByLabelText("付款状态筛选")).toHaveTextContent("未付款");
+      await user.click(screen.getByRole("button", { name: "高级筛选" }));
       expect(screen.getByLabelText("收银台状态筛选")).toHaveTextContent(
         "开放中",
       );

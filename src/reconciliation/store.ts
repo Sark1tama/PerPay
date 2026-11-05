@@ -3,9 +3,12 @@ import { readManualCandidates, type ManualCandidateQuery, type ManualCandidatePa
 import { normalizeListQuery, MATCH_SORT_FIELDS, EXCEPTION_SORT_FIELDS, type MatchSort, type ExceptionSort, type ListQuery, type ListPosition } from "../shared/list-query.ts";
 import { listKeyset, listSearch } from "../database/list-query.ts";
 import { randomUUID } from "node:crypto";
+import { auditContextAvailable, auditSiteContext } from "../audit/context.ts";
+import { appendAuditEvent } from "../database/identity-store.ts";
 import type { DatabaseSync } from "node:sqlite";
 
 import type { AppDatabase } from "../database/database.ts";
+import { SANDBOX_PROVIDER_ENDPOINT } from "../settings/model.ts";
 import {
   MAX_ORDER_CLOCK_AHEAD_MILLISECONDS,
   orderEventDetailsFingerprint,
@@ -356,8 +359,15 @@ export class ReconciliationStore {
   reconcileEntry(ledgerEntryId: string, nowInput?: number): ReconcileEntryResult {
     requireIdentifier(ledgerEntryId, "ledger entry ID");
     return this.#database.write((connection) => {
-      const now = financialNow(connection, nowInput);
       const entry = readLedgerEntry(connection, ledgerEntryId);
+      // Historical identity belongs to the immutable source binding, even if
+      // the owning account has since switched to a production application.
+      if (entry && connection.prepare(
+        "SELECT 1 FROM provider_account_bindings WHERE provider_account_key = ? AND provider_endpoint = ?",
+      ).get(entry.provider_account_key, SANDBOX_PROVIDER_ENDPOINT)) {
+        return { kind: "ignored", ledgerEntryId };
+      }
+      const now = financialNow(connection, nowInput);
       if (
         !entry ||
         entry.state === "CONFLICT" ||
@@ -472,6 +482,11 @@ export class ReconciliationStore {
           FROM ledger_entries
           WHERE state IN ('UNALLOCATED', 'CANDIDATE') AND direction = 'CREDIT'
             AND NOT EXISTS (
+              SELECT 1 FROM provider_account_bindings AS source
+               WHERE source.provider_account_key = ledger_entries.provider_account_key
+                 AND source.provider_endpoint = ?
+            )
+            AND NOT EXISTS (
               SELECT 1
                 FROM ledger_conflicts AS conflict
                WHERE conflict.existing_ledger_entry_id = ledger_entries.ledger_entry_id
@@ -485,6 +500,7 @@ export class ReconciliationStore {
           LIMIT ?`,
       )
       .all(
+        SANDBOX_PROVIDER_ENDPOINT,
         cursor?.occurredAt ?? null,
         cursor?.occurredAt ?? null,
         cursor?.occurredAt ?? null,
@@ -530,6 +546,11 @@ export class ReconciliationStore {
             WHERE orders.order_id = ?
               AND entry.state IN ('UNALLOCATED', 'CANDIDATE')
               AND NOT EXISTS (
+                SELECT 1 FROM provider_account_bindings AS source
+                 WHERE source.provider_account_key = entry.provider_account_key
+                   AND source.provider_endpoint = ?
+              )
+              AND NOT EXISTS (
                 SELECT 1
                   FROM ledger_conflicts AS conflict
                  WHERE conflict.existing_ledger_entry_id = entry.ledger_entry_id
@@ -538,7 +559,7 @@ export class ReconciliationStore {
             ORDER BY entry.occurred_at, entry.ledger_entry_id
             LIMIT ?`,
         )
-        .all(orderId, limit + 1) as Array<{ ledger_entry_id: string }>).map((row) => row.ledger_entry_id),
+        .all(orderId, SANDBOX_PROVIDER_ENDPOINT, limit + 1) as Array<{ ledger_entry_id: string }>).map((row) => row.ledger_entry_id),
     );
     const selected = ids.slice(0, limit);
     const results = selected.map((ledgerEntryId) => this.reconcileEntry(ledgerEntryId, nowInput));
@@ -2003,6 +2024,19 @@ function insertFinancialOperation(
       ).changes,
     "financial operation insert",
   );
+  if (auditContextAvailable(connection)) {
+    const order = input.orderId ? connection.prepare("SELECT api_client_id FROM payment_orders WHERE order_id = ?").get(input.orderId) : undefined;
+    const entry = input.ledgerEntryId ? connection.prepare("SELECT amount_cents FROM ledger_entries WHERE ledger_entry_id = ?").get(input.ledgerEntryId) : undefined;
+    appendAuditEvent(connection, {
+      occurredAt: input.now, actorType: input.fingerprintInput.actorType, actorId: input.fingerprintInput.actorId ?? undefined,
+      action: "financial." + input.fingerprintInput.operationType.toLowerCase(), outcome: "SUCCESS",
+      subjectType: "financial_operation", subjectId: input.financialOperationId,
+      context: auditSiteContext(connection, typeof order?.api_client_id === "string" ? order.api_client_id : null),
+      details: { financial_operation_id: input.financialOperationId, operation_type: input.fingerprintInput.operationType,
+        order_id: input.orderId, ledger_entry_id: input.ledgerEntryId, reverses_operation_id: input.reversesOperationId,
+        amount_cents: entry?.amount_cents === undefined ? null : Number(entry.amount_cents) },
+    });
+  }
   return readOperation(connection, input.financialOperationId) ?? invalidState("inserted operation cannot be read");
 }
 

@@ -8,11 +8,15 @@ import {
   within,
 } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { SystemAnalytics } from "../src/api/client";
 import { ChartAreaInteractive } from "../src/components/chart-area-interactive";
 import { DailyAnalytics } from "../src/components/daily-analytics";
 import { SectionCards as SummaryCards } from "../src/components/section-cards";
+import { CHART_TYPE_STORAGE_KEY } from "../src/hooks/use-chart-type";
+
+beforeEach(() => localStorage.removeItem(CHART_TYPE_STORAGE_KEY));
+
 function SectionCards(props: Parameters<typeof SummaryCards>[0]) {
   return (
     <MemoryRouter>
@@ -108,7 +112,9 @@ describe("official shadcn interactive chart", () => {
       ).toHaveAttribute("tabindex", "0");
       expect(container.querySelector("[data-slot=chart] style")).toBeNull();
       const metrics = screen.getByRole("group", { name: "趋势指标" });
-      expect(metrics.closest('[role="tabpanel"]')).not.toBeNull();
+      expect(screen.getAllByRole("group", { name: "趋势指标" })).toHaveLength(1);
+      const trend = screen.getByRole("heading", { name: "收款趋势" }).closest<HTMLElement>('[data-slot="card"]')!;
+      expect(within(trend).getByRole("group", { name: "趋势指标" })).toBeVisible();
       expect(
         within(metrics).getByRole("button", { name: "确认金额" }),
       ).toHaveAccessibleDescription("¥100.01");
@@ -243,7 +249,8 @@ describe("official shadcn interactive chart", () => {
     );
     await userEvent
       .setup()
-      .click(screen.getByRole("button", { name: "近 30 天" }));
+      .click(screen.getByRole("combobox", { name: "统计周期" }));
+    await userEvent.setup().click(await screen.findByRole("option", { name: "近 30 天" }));
     expect(change).toHaveBeenCalledExactlyOnceWith("30");
   });
   it("switches counts and currency instead of stacking incompatible units", async () => {
@@ -612,9 +619,13 @@ describe("paginated daily analytics report", () => {
       .toHaveTextContent("06-04");
     expect(screen.queryByText("区间金额含今日；日均与最高不含今日。"))
       .not.toBeInTheDocument();
-    const today = container.querySelector('time[datetime="2026-06-07"]')?.closest("tr");
+    const todayTime = container.querySelector('time[datetime="2026-06-07"]');
+    expect(todayTime).toHaveTextContent("2026-06-07");
+    expect(todayTime).not.toHaveAttribute("aria-label");
+    const today = todayTime?.closest("tr");
     expect(today).toHaveTextContent("今日");
     expect(today).toHaveTextContent("周日");
+    expect(today?.querySelector(".daily-date-weekday")).not.toHaveAttribute("aria-hidden");
   });
 
   it("shows no completed-day average or peak when the response only contains today", () => {
@@ -818,7 +829,13 @@ describe("shared trend and daily views", () => {
     expect(
       screen.queryByRole("group", { name: "趋势指标" }),
     ).not.toBeInTheDocument();
-    expect(screen.getAllByText("2026-06-01 — 2026-06-30")).toHaveLength(1);
+    expect(
+      screen.queryByRole("group", { name: "图表类型" }),
+    ).not.toBeInTheDocument();
+    expect(screen.getAllByText(
+      (_, element) => element?.textContent === "2026-06-01 — 2026-06-30",
+      { selector: '[aria-live="polite"]' },
+    )).toHaveLength(1);
     await user.click(screen.getByRole("button", { name: "下一页" }));
     expect(screen.getByRole("status")).toHaveTextContent("第 2/3 页 · 共 30 天");
     const dates = dailyDates();
@@ -833,7 +850,8 @@ describe("shared trend and daily views", () => {
     await user.click(dailyTab);
     expect(screen.getByRole("status")).toHaveTextContent("第 2/3 页 · 共 30 天");
     expect(dailyDates()).toEqual(dates);
-    await user.click(screen.getByRole("button", { name: "近 7 天" }));
+    await user.click(screen.getByRole("combobox", { name: "统计周期" }));
+    await user.click(await screen.findByRole("option", { name: "近 7 天" }));
     expect(change).toHaveBeenCalledExactlyOnceWith("7");
     rerender(
       <ChartAreaInteractive

@@ -20,7 +20,7 @@ import {
   type RuntimeSettings,
 } from "@/api/client";
 import { ApplicationKey, SettingsEditor } from "@/components/SettingsForms";
-import { ApplicationKeyActivation } from "@/components/ApplicationKey";
+import { ApplicationKeyActivation, hasLegacyAlipayConfiguration, LegacyAlipayNotice } from "@/components/ApplicationKey";
 import { useSuccessToast } from "@/components/Feedback";
 import { useDraftGuard } from "@/drafts";
 import {
@@ -99,7 +99,7 @@ export default function Onboarding() {
 
   return (
     <div
-      className="admin-settings-layout @container/onboarding flex w-full min-w-0 flex-col gap-5"
+      className="admin-settings-layout @container/onboarding mx-auto flex w-full min-w-0 max-w-4xl flex-col gap-4"
       data-onboarding-workspace
     >
       <PageHeaderActions>
@@ -127,6 +127,7 @@ export default function Onboarding() {
             readinessFetching} />
       </PageHeaderActions>
       <ErrorNotice
+        scope="page"
         error={instance.error}
         retry={() => {
           void instance.refetch();
@@ -188,6 +189,12 @@ function OnboardingFlow({
     if (next) void navigate(onboardingPath(next));
   }
   if (requested === "api") return <Navigate to={settings.site_mode ? "/sites" : "/settings/security"} replace />;
+  if (hasLegacyAlipayConfiguration(settings)) return (
+    <section className="flex min-w-0 flex-col gap-5" aria-labelledby="onboarding-step-heading">
+      <h2 id="onboarding-step-heading" ref={heading} tabIndex={-1} className="text-xl font-semibold outline-none">支付宝账号</h2>
+      <LegacyAlipayNotice settings={settings} />
+    </section>
+  );
   // Do not redirect based on an invalidated cached setup snapshot while its refresh is in flight.
   if (requested !== step) return resolvingSettings ? <Loading /> : <Navigate to={onboardingPath(step)} replace />;
   const completed = [
@@ -271,7 +278,8 @@ function OnboardingFlow({
                     <CollapsibleContent>
                       <ul className="flex list-inside list-disc flex-col gap-2 pt-3">
                         <li>使用收款账户创建“网页应用”。</li>
-                        <li>账号默认拥有账务明细查询权限。</li>
+                        <li>在支付宝平台完成应用上线；“开发中”应用不能查账。</li>
+                        <li>确认应用具备对应收款账户的账务明细查询权限。</li>
                         <li>支付宝搜索“收款码”申请，使用同一账户收款。</li>
                       </ul>
                     </CollapsibleContent>
@@ -284,7 +292,7 @@ function OnboardingFlow({
                           variant: "outline",
                           size: "sm",
                         })}
-                        to="/settings/provider"
+                        to="/settings/provider/edit"
                         state={deferredState}
                       >
                         导入已有应用私钥
@@ -346,11 +354,7 @@ function OnboardingFlow({
                         <span className="break-all">
                           {pendingApplicationKey.app_id}
                         </span>
-                        （
-                        {pendingApplicationKey.environment === "PRODUCTION"
-                          ? "生产环境"
-                          : "沙箱环境"}
-                        ）。 {systemName} 当前仍使用原密钥。
+                        。 {systemName} 当前仍使用原密钥。
                       </p>
                       <p>
                         上传后，将支付宝页面显示的支付宝公钥填入表单。
@@ -358,8 +362,7 @@ function OnboardingFlow({
                     </>
                   ) : (
                     <p>
-                      将同一应用的 App ID
-                      和支付宝公钥填入表单。生产收款使用生产环境。
+                      将同一已上线应用的 App ID 和支付宝公钥填入表单。
                     </p>
                   )}
                   {(pendingApplicationKey?.public_key ||
@@ -806,6 +809,7 @@ export function ReadinessCheck({
     <>
       {!view.active && <p role="status">检查已暂停</p>}
       <ErrorNotice
+        scope="page"
         error={query.error}
         retry={() => {
           void query.refetch();

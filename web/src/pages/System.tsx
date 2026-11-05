@@ -1,4 +1,4 @@
-import { useId, useRef, useState, type ReactNode } from "react";
+import { Children, isValidElement, useId, useRef, useState, type ReactNode } from "react";
 import { ChevronDown, CircleAlert, Code2 } from "lucide-react";
 import type { SystemStatus } from "@/api/client";
 import { Link } from "@/navigation";
@@ -17,7 +17,8 @@ import {
 import { LedgerIngestionDiagnostics } from "@/components/ledger-ingestion-diagnostics";
 import { AlipayAccountStatus } from "@/components/alipay-account-status";
 import { RefreshButton } from "@/components/refresh-button";
-import { ErrorNotice, Loading, QueryView } from "@/components/request-state";
+import { ErrorNotice, Loading, QueryView, ReadPausedNotice } from "@/components/request-state";
+import { useRequestConnectionOnline } from "@/lib/request-notices";
 import { TechnicalDetailsDialog } from "@/components/detail/DetailPrimitives";
 import { OfficialUpdatePanel } from "@/updates";
 import { useManualLedgerScan } from "@/features/manual-ledger-scan";
@@ -55,6 +56,7 @@ export default function System() {
 
 function SystemContent() {
   const { status, checking, unavailable } = useSystemStatus();
+  const online = useRequestConnectionOnline();
   const manualScan = useManualLedgerScan(status.data?.data);
   const refresh = () => {
     void status.refetch();
@@ -63,13 +65,9 @@ function SystemContent() {
     <div className="system-page">
       {checking ? (
         unavailable ? (
-          <div className="flex flex-col gap-3">
-            <Alert>
-              <CircleAlert />
-              <AlertTitle>暂时无法确认运行状态</AlertTitle>
-            </Alert>
-            <ErrorNotice error={status.error} retry={refresh} />
-          </div>
+          !online || status.isPaused ? <ReadPausedNotice />
+            : status.error ? <ErrorNotice scope="page" error={status.error} retry={refresh} />
+              : <p className="text-sm text-muted-foreground">暂时无法确认运行状态</p>
         ) : (
           <Loading label="正在读取运行状态…" />
         )
@@ -106,6 +104,7 @@ function SystemSnapshot({
   manualScan: ReturnType<typeof useManualLedgerScan>;
 }) {
   const state = presentSystemStatus(data);
+  const attentionCount = [state.ledgerHealthy, state.reconciliationHealthy, state.webhookHealthy, data.database.ok, state.backupHealthy].filter(healthy => !healthy).length;
   const [diagnosticsOpen, setDiagnosticsOpen] = useState(false);
   const diagnosticTrigger = useRef<HTMLButtonElement>(null);
   const manualScanFeedbackId = useId();
@@ -129,6 +128,10 @@ function SystemSnapshot({
     data.work_items !== null;
   return (
     <section className="runtime-surface" aria-label="服务运行状态">
+      <div className="flex flex-wrap items-center justify-between gap-2" data-system-health-summary>
+        <p className="text-sm font-medium">{state.canReceive ? "收款服务可用" : "收款服务需处理"}</p>
+        <Badge variant={attentionCount ? "warning" : "success"}>{attentionCount ? `${attentionCount} 项需关注` : "运行正常"}</Badge>
+      </div>
       <div className="runtime-toolbar">
         <p className="runtime-checked">
           更新于 <RuntimeTimestamp value={updatedAt} />
@@ -206,6 +209,7 @@ function SystemSnapshot({
           </TableRow>
         </TableHeader>
         <TableBody role="rowgroup">
+          <RuntimeServices>
           <RuntimeService
             onDiagnose={openDiagnostics}
             title="查账"
@@ -386,6 +390,7 @@ function SystemSnapshot({
               <p>暂无可用备份。</p>
             )}
           </RuntimeService>
+          </RuntimeServices>
         </TableBody>
       </Table>
       <TechnicalDetailsDialog
@@ -402,6 +407,14 @@ function SystemSnapshot({
       />
     </section>
   );
+}
+
+function RuntimeServices({ children }: { children: ReactNode }) {
+  // A problem and its explanation stay adjacent, ahead of healthy services.
+  return <>{Children.toArray(children).sort((left, right) => {
+    const rank = (item: ReactNode) => isValidElement<{ healthy: boolean }>(item) && item.props.healthy ? 1 : 0;
+    return rank(left) - rank(right);
+  })}</>;
 }
 
 function ManualScanFeedback({ control, id }: { control: ReturnType<typeof useManualLedgerScan>; id: string }) {

@@ -35,7 +35,7 @@ import {
 import { useCompactList } from "@/hooks/use-compact-list";
 import { useListSize } from "@/hooks/use-list-size";
 import { LinkedSummaryRow, LinkedTableRow } from "@/components/LinkedTableRow";
-import { ListSummary } from "@/components/list-primitives";
+import { ListRowPresentation, ListSummary } from "@/components/list-primitives";
 import { ListColumnsMenu, useListDisplay } from "@/components/list-columns";
 import { useListDensity } from "@/components/list-density";
 import {
@@ -50,6 +50,7 @@ import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Field, FieldGroup, FieldLabel, FieldLegend, FieldSet } from "@/components/ui/field";
 import { ItemGroup } from "@/components/ui/item";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import {
   DropdownMenu,
   DropdownMenuTrigger,
@@ -211,9 +212,9 @@ function BusinessTableView<T extends RowData>({
   const visibility = useMemo(
     () =>
       isSummary
-        ? resolveSummaryVisibility(specs, overrides)
+        ? resolveSummaryVisibility(specs, embedded ? overrides : {})
         : resolveColumnVisibility(specs, overrides, size),
-    [specs, overrides, size, isSummary],
+    [specs, overrides, size, isSummary, embedded],
   );
   const context = useMemo<BusinessCellContext>(
     () => ({
@@ -230,8 +231,7 @@ function BusinessTableView<T extends RowData>({
           ? column.summaryPriority === "primary"
           : column.summaryDefault === true;
       },
-      showInSummary: (key) =>
-        !isSummary && visibility[key] === false && overrides[key] !== false,
+      showInSummary: () => false,
       visibleColumnCount: Object.values(visibility).filter(Boolean).length,
     }),
     [visibility, overrides, isSummary, specs],
@@ -278,7 +278,7 @@ function BusinessTableView<T extends RowData>({
       if (sort && field) control?.setSort(field, sort.desc ? "desc" : "asc");
     },
   });
-  const columnMenu = columnsMenu && (inlineColumns ? (
+  const columnMenu = columnsMenu && !isSummary && (inlineColumns ? (
     <FieldSet data-list-columns-panel>
       <FieldLegend variant="label">
         {isSummary ? "显示信息（标识与操作固定）" : "显示列（标识与操作固定）"}
@@ -310,20 +310,23 @@ function BusinessTableView<T extends RowData>({
     </FieldSet>
   ) : (
     <DropdownMenu>
-      <DropdownMenuTrigger
-        render={
-          <Button
-            variant={compact ? "ghost" : "outline"}
-            size={compact ? "icon-sm" : "sm"}
-          />
-        }
-        aria-label="显示列"
-        title={isSummary ? "显示信息" : "显示列"}
-        data-list-columns-trigger
-      >
-        <Columns3 data-icon="inline-start" />
-        {!compact && (isSummary ? "显示信息" : "显示列")}
-      </DropdownMenuTrigger>
+      <Tooltip>
+        <TooltipTrigger render={
+          <DropdownMenuTrigger
+            render={
+              <Button
+                variant={compact ? "ghost" : "outline"}
+                size="icon-sm"
+              />
+            }
+            aria-label="显示列"
+            data-list-columns-trigger
+          >
+            <Columns3 data-icon="inline-start" aria-hidden="true" />
+          </DropdownMenuTrigger>
+        } />
+        <TooltipContent>{isSummary ? "显示信息" : "显示列"}</TooltipContent>
+      </Tooltip>
       <DropdownMenuContent align="end" className="min-w-48">
         <DropdownMenuGroup>
           <DropdownMenuLabel>
@@ -356,6 +359,7 @@ function BusinessTableView<T extends RowData>({
     </DropdownMenu>
   ));
   return (
+    <ListRowPresentation compact={!embedded}>
     <div
       ref={container}
       className="flex min-w-0 flex-col gap-2"
@@ -364,7 +368,7 @@ function BusinessTableView<T extends RowData>({
       data-density={density}
       data-embedded={embedded}
     >
-      {columnMenu && <ListColumnsMenu summary={size.container > 0 ? isSummary : undefined}>{columnMenu}</ListColumnsMenu>}
+      {columnsMenu && <ListColumnsMenu summary={size.container > 0 ? isSummary : undefined}>{columnMenu}</ListColumnsMenu>}
       <div
         className="business-table-surface min-w-0 overflow-hidden"
         data-density={density}
@@ -501,5 +505,6 @@ function BusinessTableView<T extends RowData>({
         )}
       </div>
     </div>
+    </ListRowPresentation>
   );
 }

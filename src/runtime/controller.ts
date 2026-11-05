@@ -32,10 +32,12 @@ import {
   type ReconciliationSchedulerHealth,
   type ReconciliationStore,
 } from "../reconciliation/index.ts";
-import type { InstanceRuntimeSettingsSnapshot, RuntimeSettingsSnapshot } from "../settings/model.ts";
+import { isProductionProvider, type InstanceRuntimeSettingsSnapshot, type RuntimeSettingsSnapshot } from "../settings/model.ts";
 type PaymentRuntimeSnapshot = RuntimeSettingsSnapshot | InstanceRuntimeSettingsSnapshot;
 import { SettingsError } from "../settings/store.ts";
 import { collectionCodeError } from "../shared/collection-code.ts";
+import type { ActivityRecorder } from "../audit/activity.ts";
+import { createAuditContext, runWithAuditContext } from "../audit/context.ts";
 
 export interface RevisionedLedgerHealth extends LedgerSchedulerHealth {
   readonly enabled: boolean;
@@ -57,6 +59,7 @@ export interface PaymentRuntimeStatus {
 }
 
 interface RuntimeControllerOptions {
+  readonly activity?: ActivityRecorder | undefined;
   readonly database: AppDatabase;
   readonly orders: OrderService;
   readonly ledger: LedgerStore;
@@ -106,6 +109,7 @@ const disabledReconciliationHealth: RevisionedReconciliationHealth = Object.free
 
 /** Owns every background worker that depends on mutable business settings. */
 export class RuntimeController {
+  readonly #activity: ActivityRecorder | undefined;
   readonly #database: AppDatabase;
   readonly #orders: OrderService;
   readonly #ledger: LedgerStore;
@@ -133,6 +137,7 @@ export class RuntimeController {
   #mutation: Promise<void> = Promise.resolve();
 
   constructor(options: RuntimeControllerOptions) {
+    this.#activity = options.activity;
     this.#database = options.database;
     this.#orders = options.orders;
     this.#ledger = options.ledger;
@@ -195,6 +200,9 @@ export class RuntimeController {
 
   accountHealth(accountId: string): AccountRuntimeHealth {
     const account = this.#accounts?.().find(account => account.id === accountId);
+    if (account && account.environment !== "PRODUCTION") {
+      return { state: "unsupported", lastSuccessAt: null, lastErrorCode: "provider_environment_unsupported", collectionReady: false };
+    }
     const worker = this.#accountWorkers.get(accountId);
     const health = worker?.scheduler.health();
     const lastSuccessAt = health?.lastSuccessAt ?? null;
@@ -222,12 +230,13 @@ export class RuntimeController {
 
   status(): PaymentRuntimeStatus {
     const snapshot = this.#snapshot;
-    const provider = this.#accounts?.().find(account => account.provider)?.provider ?? snapshot?.provider;
+    const provider = this.#accounts ? this.#accounts().find(account => isProductionProvider(account.provider))?.provider
+      : isProductionProvider(snapshot?.provider) ? snapshot.provider : null;
     return Object.freeze({
-      configured: this.#accounts ? this.#accounts().some(account => account.configured && account.enabled) : snapshot !== null && isPaymentConfigured(snapshot),
+      configured: this.#accounts ? this.#accounts().some(account => account.environment === "PRODUCTION" && account.configured && account.enabled && isProductionProvider(account.provider)) : snapshot !== null && isPaymentConfigured(snapshot),
       transitioning: this.#transitioning,
       paymentRevision: snapshot?.paymentRevision ?? 0,
-      activeProviderAccountKey: snapshot?.activeProviderAccountKey ?? null,
+      activeProviderAccountKey: isProductionProvider(snapshot?.provider) ? snapshot.activeProviderAccountKey : null,
       scanIntervalMilliseconds: provider?.scanIntervalMilliseconds ?? null,
       maximumSuccessAgeMilliseconds: provider?.maximumSuccessAgeMilliseconds ?? null,
     });
@@ -493,7 +502,7 @@ export class RuntimeController {
     this.#orders.initialize();
     for (const [id, worker] of this.#accountWorkers) {
       const account = accounts.find(account => account.id === id);
-      if (account?.provider && account.providerAccountKey && account.revision === worker.account.revision &&
+      if (account?.environment === "PRODUCTION" && isProductionProvider(account.provider) && account.providerAccountKey && account.revision === worker.account.revision &&
         previous?.paymentRevision === snapshot.paymentRevision) continue;
       worker.manualScanner.invalidate();
       await worker.scheduler.stop();
@@ -503,11 +512,11 @@ export class RuntimeController {
       const reconciliation = this.#createReconciliationScheduler(snapshot.paymentRevision);
       this.#reconciliationScheduler = reconciliation;
       this.#reconciliationRevision = snapshot.paymentRevision;
-      void reconciliation.start().catch(error => logRuntimeError("reconciliation_scheduler_startup_failed", error));
+      void reconciliation.start().catch(error => this.#logError("reconciliation_scheduler_startup_failed", error));
     }
     this.#snapshot = snapshot;
     for (const account of accounts) {
-      if (!account.provider || !account.providerAccountKey || this.#accountWorkers.has(account.id) ||
+      if (account.environment !== "PRODUCTION" || !isProductionProvider(account.provider) || !account.providerAccountKey || this.#accountWorkers.has(account.id) ||
         this.#accountTransitions.has(account.id) || this.#stopped) continue;
       const accountSnapshot: PaymentRuntimeSnapshot = { ...snapshot,
         provider: account.provider, activeProviderAccountKey: account.providerAccountKey,
@@ -620,7 +629,7 @@ export class RuntimeController {
     try {
       ledger.start();
       void reconciliation.start().catch((error: unknown) => {
-        logRuntimeError("reconciliation_scheduler_startup_failed", error);
+        this.#logError("reconciliation_scheduler_startup_failed", error);
       });
     } catch (error) {
       await this.#stopPaymentSchedulers().catch(() => undefined);
@@ -634,7 +643,7 @@ export class RuntimeController {
     this.#webhookScheduler = webhook;
     try {
       void webhook.start().catch((error: unknown) => {
-        logRuntimeError("webhook_scheduler_startup_failed", error);
+        this.#logError("webhook_scheduler_startup_failed", error);
       });
     } catch (error) {
       this.#webhookScheduler = null;
@@ -646,7 +655,7 @@ export class RuntimeController {
   #createLedgerScheduler(snapshot: PaymentRuntimeSnapshot): LedgerIngestScheduler {
     const providerSettings = snapshot.provider;
     const providerAccountKey = snapshot.activeProviderAccountKey;
-    if (!providerSettings || !providerAccountKey) {
+    if (!isProductionProvider(providerSettings) || !providerAccountKey) {
       throw new Error("payment runtime was started without provider settings");
     }
     const activation = this.#accounts ? this.#ledger.providerIdentity(providerAccountKey) : this.#ledger.activeProviderIdentity();
@@ -685,6 +694,8 @@ export class RuntimeController {
       clock: this.#clock,
     });
     return new LedgerIngestScheduler({
+      activity: this.#activity,
+      providerAccountKey,
       service,
       minimumIntervalMilliseconds: providerSettings.minimumScanIntervalMilliseconds ?? providerSettings.activeScanIntervalMilliseconds,
       gate: ledgerScanGate(this.#database, providerAccountKey),
@@ -713,16 +724,17 @@ export class RuntimeController {
         }));
         if (this.#accounts || this.#reconciliationRevision === snapshot.paymentRevision) {
           void this.triggerReconciliation("ledger_scan").catch((error: unknown) => {
-            logRuntimeError("reconciliation_sweep_trigger_failed", error);
+            this.#logError("reconciliation_sweep_trigger_failed", error);
           });
         }
       },
-      onUnexpectedError: (error) => logRuntimeError("ledger_scheduler_failed", error),
+      onUnexpectedError: (error) => this.#logError("ledger_scheduler_failed", error),
     });
   }
 
   #createReconciliationScheduler(paymentRevision: number): ReconciliationScheduler {
     return new ReconciliationScheduler({
+      activity: this.#activity,
       store: this.#reconciliation,
       intervalMilliseconds: 60_000,
       batchSize: 64,
@@ -746,14 +758,14 @@ export class RuntimeController {
       },
       onAutoSettled: () => {
         void this.triggerWebhook("auto_settlement").catch((error: unknown) => {
-          logRuntimeError("webhook_delivery_trigger_failed", error);
+          this.#logError("webhook_delivery_trigger_failed", error);
         });
       },
       onEntryError: (error, ledgerEntryId) => {
-        logRuntimeError("reconciliation_entry_failed", error, { ledger_entry_id: ledgerEntryId });
+        this.#logError("reconciliation_entry_failed", error, { ledger_entry_id: ledgerEntryId });
       },
       onOrderError: (error, orderId) => {
-        logRuntimeError("reconciliation_order_failed", error, { order_id: orderId });
+        this.#logError("reconciliation_order_failed", error, { order_id: orderId });
       },
     });
   }
@@ -761,7 +773,7 @@ export class RuntimeController {
   #createWebhookScheduler(snapshot: PaymentRuntimeSnapshot): WebhookScheduler {
     let service: WebhookDeliveryService | SiteWebhookProcessor;
     if (this.#sites) {
-      service = new SiteWebhookProcessor({ sites: this.#sites, webhooks: this.#webhooks, clock: this.#clock });
+      service = new SiteWebhookProcessor({ sites: this.#sites, webhooks: this.#webhooks, clock: this.#clock, activity: this.#activity });
     } else {
     if (!isWebhookConfigured(snapshot)) {
       throw new Error("webhook runtime was started without complete settings");
@@ -775,6 +787,7 @@ export class RuntimeController {
       throw new Error("webhook signing key synchronization failed");
     }
     service = new WebhookDeliveryService({
+      activity: this.#activity,
       store: this.#webhooks,
       config: {
         secret: config.secret,
@@ -788,6 +801,7 @@ export class RuntimeController {
     });
     }
     return new WebhookScheduler({
+      activity: this.#activity,
       service,
       store: this.#webhooks,
       intervalMilliseconds: 1_000,
@@ -806,14 +820,23 @@ export class RuntimeController {
           dead_letters: health.deadLetters,
         }));
       },
-      onUnexpectedError: (error) => logRuntimeError("webhook_scheduler_failed", error),
+      onUnexpectedError: (error) => this.#logError("webhook_scheduler_failed", error),
+    });
+  }
+
+  #logError(event: string, error: unknown, details: Readonly<Record<string, unknown>> = {}): void {
+    logRuntimeError(event, error, details);
+    if (!this.#activity) return;
+    runWithAuditContext(createAuditContext({ actorType: "SYSTEM", actorId: "runtime" }), () => {
+      this.#activity?.record({ action: event, sourceType: "BACKGROUND", outcome: "FAILURE",
+        details: { ...details, error_type: error instanceof Error ? error.name : "unknown_error" } });
     });
   }
 }
 
 function isPaymentConfigured(snapshot: PaymentRuntimeSnapshot): boolean {
   return snapshot.collection !== null && collectionCodeError(snapshot.collection.codePayload) === null &&
-    snapshot.provider !== null &&
+    isProductionProvider(snapshot.provider) &&
     snapshot.activeProviderAccountKey !== null;
 }
 
